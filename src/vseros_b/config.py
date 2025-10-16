@@ -20,8 +20,8 @@ TRAIN_PATH = Path("/content/drive/MyDrive/ML/Всерос по ИИ 2025/Осн�
 SAMPLE_PATH = Path("/content/drive/MyDrive/ML/Всерос по ИИ 2025/Основной этап/B/sample_submission.csv")
 
 # Куда складываем артефакты и сабмиты
-ARTIFACT_DIR = Path("/content/drive/MyDrive/ML/tshop/artifacts")
-SUB_DIR      = Path("/content/drive/MyDrive/ML/tshop/submissions")
+ARTIFACT_DIR = Path("/content/drive/MyDrive/ML/Всерос по ИИ 2025/Основной этап/B/artifacts")
+SUB_DIR      = Path("/content/drive/MyDrive/ML/Всерос по ИИ 2025/Основной этап/B/submissions")
 
 # Подпапки внутри артефактов
 INTERM_DIR   = ARTIFACT_DIR / "intermediates"   # кеши (basket_items, item_support, графы, ...)
