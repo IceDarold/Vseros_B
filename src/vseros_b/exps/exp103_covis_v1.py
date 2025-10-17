@@ -25,18 +25,28 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Literal
 import numpy as np
 import pandas as pd
 
-from .base_exp import BaseExperiment
-from .config import (
-    PATHS, COL_USER, COL_ITEM, COL_DATE,
-    DECAY_LAMBDA_COVIS, TOPN_NEIGHBORS_PER_ITEM,
-    K_RECENT_ITEMS_PER_USER, CAND_TOP_M_PER_USER,
-    COVIS_MIN_PAIR_COUNT, QUICK_MODE, QUICK_USERS, SEED,
+from ..artifacts import ensure_dir, log_artifact, save_df
+from ..base_exp import BaseExperiment
+from ..config import (
+    CAND_TOP_M_PER_USER,
+    COL_DATE,
+    COL_ITEM,
+    COL_USER,
+    COVIS_MIN_PAIR_COUNT,
+    DECAY_LAMBDA_COVIS,
+    K_RECENT_ITEMS_PER_USER,
+    PATHS,
+    QUICK_MODE,
+    QUICK_USERS,
+    SEED,
+    TOPN_NEIGHBORS_PER_ITEM,
 )
-from .artifacts import ensure_dir, save_df, log_artifact
-from .metrics import recall_at_m
-from .covis import (
-    CoVisConfig, build_neighbors,
-    last_k_items_by_user, candidates_from_covis,
+from ..metrics import recall_at_m
+from ..candidates.covis import (
+    CoVisConfig,
+    build_neighbors,
+    candidates_from_covis,
+    last_k_items_by_user,
 )
 
 

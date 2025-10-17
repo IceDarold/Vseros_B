@@ -26,18 +26,26 @@ import numpy as np
 import pandas as pd
 import json
 
-from .base_exp import BaseExperiment
-from .config import (
-    PATHS, COL_USER, COL_ITEM, COL_DATE,
-    K_RECENT_ITEMS_PER_USER, CAND_TOP_M_PER_USER,
-    QUICK_MODE, QUICK_USERS, SEED,
+from ..artifacts import ensure_dir, log_artifact, save_json
+from ..base_exp import BaseExperiment
+from ..candidates.ppr import (
+    GraphPPR,
+    build_bipartite_matrices,
+    ppr_candidates_from_seeds,
+    recent_items_by_user_ids,
 )
-from .artifacts import ensure_dir, save_json, log_artifact
-from .metrics import recall_at_m
-from .ppr import (
-    GraphPPR, build_bipartite_matrices,
-    recent_items_by_user_ids, ppr_candidates_from_seeds,
+from ..config import (
+    CAND_TOP_M_PER_USER,
+    COL_DATE,
+    COL_ITEM,
+    COL_USER,
+    K_RECENT_ITEMS_PER_USER,
+    PATHS,
+    QUICK_MODE,
+    QUICK_USERS,
+    SEED,
 )
+from ..metrics import recall_at_m
 
 
 # ----------------------------- Конфиг и состояние -----------------------------

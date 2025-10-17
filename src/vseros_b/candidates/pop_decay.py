@@ -14,8 +14,8 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from .config import COL_USER, COL_ITEM, COL_DATE
-from .metrics import coverage_at_k, mapk, hitk, ndcgk
+from ..config import COL_USER, COL_ITEM, COL_DATE
+from ..metrics import coverage_at_k, mapk, hitk, ndcgk
 
 
 # ============================== расчёт скоров ==============================

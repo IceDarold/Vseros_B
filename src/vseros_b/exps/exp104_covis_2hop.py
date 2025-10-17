@@ -28,16 +28,25 @@ import pandas as pd
 import glob
 import os
 
-from .base_exp import BaseExperiment
-from .config import (
-    PATHS, COL_USER, COL_ITEM, COL_DATE,
-    TOPN_NEIGHBORS_PER_ITEM, K_RECENT_ITEMS_PER_USER, CAND_TOP_M_PER_USER,
-    QUICK_MODE, QUICK_USERS, SEED,
+from ..artifacts import ensure_dir, log_artifact, save_df
+from ..base_exp import BaseExperiment
+from ..config import (
+    CAND_TOP_M_PER_USER,
+    COL_DATE,
+    COL_ITEM,
+    COL_USER,
+    K_RECENT_ITEMS_PER_USER,
+    PATHS,
+    QUICK_MODE,
+    QUICK_USERS,
+    SEED,
+    TOPN_NEIGHBORS_PER_ITEM,
 )
-from .artifacts import ensure_dir, save_df, log_artifact
-from .metrics import recall_at_m
-from .covis import (
-    neighbors_to_map, last_k_items_by_user, candidates_from_covis,
+from ..metrics import recall_at_m
+from ..candidates.covis import (
+    candidates_from_covis,
+    last_k_items_by_user,
+    neighbors_to_map,
 )
 
 # ----------------------------- Конфиг и состояние -----------------------------

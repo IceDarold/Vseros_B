@@ -22,18 +22,26 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Literal, Unio
 import numpy as np
 import pandas as pd
 
-from .base_exp import BaseExperiment
-from .config import (
-    PATHS, COL_USER, COL_ITEM,
-    CAND_TOP_M_PER_USER, QUICK_MODE, QUICK_USERS, SEED,
+from ..artifacts import ensure_dir
+from ..base_exp import BaseExperiment
+from ..candidates.lightgcn_import import (
+    ImportConfig,
+    LGCNEmbeddings,
+    build_seen_map,
+    load_embeddings,
+    rank_users,
 )
-from .artifacts import ensure_dir
-from .metrics import recall_at_m
-from .pop_decay import compute_pop_static, build_global_top
-from .lightgcn_import import (
-    ImportConfig, LGCNEmbeddings,
-    load_embeddings, build_seen_map, rank_users,
+from ..candidates.pop_decay import build_global_top, compute_pop_static
+from ..config import (
+    CAND_TOP_M_PER_USER,
+    COL_ITEM,
+    COL_USER,
+    PATHS,
+    QUICK_MODE,
+    QUICK_USERS,
+    SEED,
 )
+from ..metrics import recall_at_m
 
 # W&B — мягко
 try:

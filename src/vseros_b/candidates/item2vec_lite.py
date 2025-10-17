@@ -37,10 +37,15 @@ except Exception:
     CallbackAny2Vec = object  # type: ignore
     _GENSIM = False
 
-from .config import (
-    COL_USER, COL_ITEM, COL_DATE,
-    I2V_DIM, I2V_NS, I2V_TOPN,
-    K_RECENT_ITEMS_PER_USER, CAND_TOP_M_PER_USER,
+from ..config import (
+    COL_USER,
+    COL_ITEM,
+    COL_DATE,
+    I2V_DIM,
+    I2V_NS,
+    I2V_TOPN,
+    K_RECENT_ITEMS_PER_USER,
+    CAND_TOP_M_PER_USER,
     SEED,
 )
 from .covis import last_k_items_by_user, candidates_from_covis

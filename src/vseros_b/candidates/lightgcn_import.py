@@ -37,7 +37,7 @@ except Exception:
     faiss = None  # type: ignore
     _FAISS = False
 
-from .config import COL_USER, COL_ITEM, PATHS
+from ..config import COL_USER, COL_ITEM, PATHS
 
 
 # ============================== модели данных ==============================
