@@ -15,7 +15,7 @@ exp106_lightgcn_import.py — Stage 1 / Эксперимент 106: импорт
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Literal, Union
 
@@ -49,7 +49,7 @@ except Exception:
 @dataclass
 class Exp106Config:
     # откуда брать эмбеддинги (если все пути None — попытаемся загрузить из стандартных локальных путей)
-    import_cfg: ImportConfig = ImportConfig()
+    import_cfg: ImportConfig = field(default_factory=ImportConfig)
 
     # пул кандидатов (ограничение для скоринга)
     pool_mode: Literal["none", "popular", "file"] = "popular"
