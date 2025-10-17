@@ -24,19 +24,32 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from .base_exp import BaseExperiment
-from .config import (
-    PATHS, COL_USER, COL_ITEM, COL_DATE,
-    I2V_DIM, I2V_NS, I2V_TOPN,
-    K_RECENT_ITEMS_PER_USER, CAND_TOP_M_PER_USER,
-    QUICK_MODE, QUICK_USERS, SEED, FORCE_REBUILD,
+from ..artifacts import ensure_dir, log_artifact, save_df
+from ..base_exp import BaseExperiment
+from ..config import (
+    CAND_TOP_M_PER_USER,
+    COL_DATE,
+    COL_ITEM,
+    COL_USER,
+    FORCE_REBUILD,
+    I2V_DIM,
+    I2V_NS,
+    I2V_TOPN,
+    K_RECENT_ITEMS_PER_USER,
+    PATHS,
+    QUICK_MODE,
+    QUICK_USERS,
+    SEED,
 )
-from .artifacts import ensure_dir, save_df, log_artifact
-from .metrics import recall_at_m
-from .item2vec_lite import (
-    I2VConfig, build_sentences_from_baskets, train_item2vec,
-    extract_item_embeddings, build_neighbors_from_embeddings,
-    candidates_from_item2vec, embeddings_to_df,
+from ..metrics import recall_at_m
+from ..candidates.item2vec_lite import (
+    I2VConfig,
+    build_neighbors_from_embeddings,
+    build_sentences_from_baskets,
+    candidates_from_item2vec,
+    embeddings_to_df,
+    extract_item_embeddings,
+    train_item2vec,
 )
 
 # W&B — мягко

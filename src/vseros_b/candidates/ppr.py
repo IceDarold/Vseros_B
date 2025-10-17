@@ -27,9 +27,12 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
-from .config import (
-    COL_USER, COL_ITEM, COL_DATE,
-    K_RECENT_ITEMS_PER_USER, CAND_TOP_M_PER_USER,
+from ..config import (
+    COL_USER,
+    COL_ITEM,
+    COL_DATE,
+    K_RECENT_ITEMS_PER_USER,
+    CAND_TOP_M_PER_USER,
 )
 # переиспользуем готовую функцию сбора последних K айтемов
 from .covis import last_k_items_by_user

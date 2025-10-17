@@ -4,7 +4,8 @@
 Держим все пути и дефолтные гиперы тут, чтобы не размазывать по ноутам.
 """
 
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
@@ -13,20 +14,25 @@ COL_USER = "user_id"
 COL_ITEM = "item_id"
 COL_DATE = "date"
 
-# ==== базовые пути (под твой Google Drive) ====
-# Если хочешь переопределять через переменные окружения — можно так:
-# os.getenv("TSHOP_DATA_PATH", "/content/.../train_data.pq")
-TRAIN_PATH = Path("/content/drive/MyDrive/ML/Всерос по ИИ 2025/Основной этап/B/train_data.pq")
-SAMPLE_PATH = Path("/content/drive/MyDrive/ML/Всерос по ИИ 2025/Основной этап/B/sample_submission.csv")
+# ==== базовые пути (переопределяются через переменные окружения) ====
 
-# Куда складываем артефакты и сабмиты
-ARTIFACT_DIR = Path("/content/drive/MyDrive/ML/Всерос по ИИ 2025/Основной этап/B/artifacts")
-SUB_DIR      = Path("/content/drive/MyDrive/ML/Всерос по ИИ 2025/Основной этап/B/submissions")
+def _path_from_env(var: str, default: Path) -> Path:
+    value = os.getenv(var)
+    if value:
+        return Path(value).expanduser()
+    return default
 
-# Подпапки внутри артефактов
-INTERM_DIR   = ARTIFACT_DIR / "intermediates"   # кеши (basket_items, item_support, графы, ...)
-CAND_DIR     = ARTIFACT_DIR / "candidates"      # пер-юзер кандидаты (parquet)
-METRICS_DIR  = ARTIFACT_DIR / "metrics"         # метрики (json/csv)
+PROJECT_ROOT = _path_from_env("VSEROS_B_PROJECT_ROOT", Path(__file__).resolve().parents[2])
+DATA_DIR = _path_from_env("VSEROS_B_DATA_DIR", PROJECT_ROOT / "data")
+ARTIFACT_DIR = _path_from_env("VSEROS_B_ARTIFACT_DIR", PROJECT_ROOT / "artifacts")
+SUB_DIR = _path_from_env("VSEROS_B_SUBMISSIONS_DIR", PROJECT_ROOT / "submissions")
+
+INTERM_DIR = _path_from_env("VSEROS_B_INTERMEDIATE_DIR", ARTIFACT_DIR / "intermediates")  # кеши (basket_items, item_support, графы, ...)
+CAND_DIR = _path_from_env("VSEROS_B_CANDIDATES_DIR", ARTIFACT_DIR / "candidates")        # пер-юзер кандидаты (parquet)
+METRICS_DIR = _path_from_env("VSEROS_B_METRICS_DIR", ARTIFACT_DIR / "metrics")           # метрики (json/csv)
+
+TRAIN_PATH = _path_from_env("VSEROS_B_TRAIN_PATH", DATA_DIR / "train_data.pq")
+SAMPLE_PATH = _path_from_env("VSEROS_B_SAMPLE_PATH", DATA_DIR / "sample_submission.csv")
 
 # ==== валидация ====
 VAL_DAYS = 7  # последние 7 дней → вал
@@ -79,6 +85,8 @@ class SplitInfo:
 
 @dataclass
 class Paths:
+    project_root: Path = PROJECT_ROOT
+    data_dir: Path = DATA_DIR
     train_path: Path = TRAIN_PATH
     sample_path: Path = SAMPLE_PATH
     artifact_dir: Path = ARTIFACT_DIR
@@ -88,11 +96,8 @@ class Paths:
     sub_dir: Path = SUB_DIR
 
     def ensure(self) -> None:
-        self.artifact_dir.mkdir(parents=True, exist_ok=True)
-        self.interm_dir.mkdir(parents=True, exist_ok=True)
-        self.cand_dir.mkdir(parents=True, exist_ok=True)
-        self.metrics_dir.mkdir(parents=True, exist_ok=True)
-        self.sub_dir.mkdir(parents=True, exist_ok=True)
+        for attr in ("artifact_dir", "interm_dir", "cand_dir", "metrics_dir", "sub_dir"):
+            getattr(self, attr).mkdir(parents=True, exist_ok=True)
 
 # Удобный единый объект путей (можно импортить и сразу ensure())
 PATHS = Paths()

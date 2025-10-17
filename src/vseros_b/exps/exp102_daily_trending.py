@@ -22,20 +22,29 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Literal
 import numpy as np
 import pandas as pd
 
-from .base_exp import BaseExperiment
-from .config import (
-    PATHS, COL_USER, COL_ITEM, COL_DATE,
-    TRENDING_WINDOWS, CAND_TOP_M_PER_USER, VAL_DAYS,
-    WANDB_PROJECT, WANDB_GROUP, SEED, QUICK_MODE, QUICK_USERS,
+from ..artifacts import ensure_dir, log_artifact, save_df
+from ..base_exp import BaseExperiment
+from ..config import (
+    CAND_TOP_M_PER_USER,
+    COL_DATE,
+    COL_ITEM,
+    COL_USER,
+    PATHS,
+    QUICK_MODE,
+    QUICK_USERS,
+    SEED,
+    TRENDING_WINDOWS,
+    VAL_DAYS,
+    WANDB_GROUP,
+    WANDB_PROJECT,
 )
-from .artifacts import ensure_dir, save_df, log_artifact
-from .trending import (
+from ..candidates.trending import (
     build_val_day_toplists,
     candidates_from_day_toplists,
     evaluate_trending_candidates,
-    coverage_from_frozen_trending,
     trending_global_from_last_train_window,
 )
+from ..metrics import coverage_at_k
 
 
 @dataclass
@@ -87,8 +96,8 @@ class Exp102DailyTrending(BaseExperiment):
         val_truth: Mapping[int, set] = context["val_truth"]
         val_item_cnt: pd.Series      = context["val_item_cnt"]
 
-        # rolling_online нуждается в общем df_all (train + вал-история)
-        df_all = pd.concat([train_df, val_df], axis=0, ignore_index=True)
+        if self.cfg.mode != "frozen_train":
+            raise ValueError("Only mode='frozen_train' is supported in the current implementation.")
 
         # быстрый режим: подсэмплировать пользователей валидации
         users_val = list(val_truth.keys())
@@ -101,19 +110,40 @@ class Exp102DailyTrending(BaseExperiment):
         cov_rows: List[pd.DataFrame] = []
 
         for W in self.cfg.windows:
-            # 1) day tops
+            # 1) day tops (train-only window, без утечек)
             day_top = build_val_day_toplists(
-                df_all=(train_df if self.cfg.mode == "frozen_train" else df_all),
-                split=split, window=int(W), K=int(self.cfg.day_top_k),
-                mode=self.cfg.mode
+                train_df=train_df,
+                split=split,
+                window_days=int(W),
+                topk_per_day=max(int(self.cfg.day_top_k), int(self.cfg.per_user_M)),
+                min_item_freq=1,
+                decay_lambda=0.0,
             )
             day_tops_by_W[W] = day_top
             self._save_day_tops(W, day_top)  # артефакт day_tops
 
-            # 2) per-user candidates на вал
-            #    (объединяем топы по вал-дням пользователя; ограничиваемся users_val при quick)
+            backfill_topk = max(
+                int(self.cfg.per_user_M),
+                int(self.cfg.day_top_k),
+                max([int(k) for k in self.cfg.coverage_ks] or [0]),
+            )
+            backfill = trending_global_from_last_train_window(
+                train_df=train_df,
+                split=split,
+                window_days=int(W),
+                topk=backfill_topk,
+                min_item_freq=1,
+                decay_lambda=0.0,
+            )
+
+            # 2) per-user candidates на вал (ограничиваемся users_val при quick)
             val_df_subset = val_df[val_df[COL_USER].isin(users_val)] if users_val else val_df
-            cand = candidates_from_day_tops(val_df_subset, day_top, K=self.cfg.per_user_M)
+            cand = candidates_from_day_toplists(
+                val_df=val_df_subset,
+                toplists=day_top,
+                M=int(self.cfg.per_user_M),
+                backfill=backfill,
+            )
             cand_by_user_by_W[W] = cand
 
             # 3) recall@M
@@ -127,10 +157,9 @@ class Exp102DailyTrending(BaseExperiment):
             metrics_rows.append(rec_tbl)
 
             # 4) coverage@K (только для frozen_train)
-            if self.cfg.mode == "frozen_train":
-                cov_tbl = coverage_from_frozen_trending(train_df, val_item_cnt, split, window=W, ks=self.cfg.coverage_ks)
-                cov_tbl["window"] = int(W)
-                cov_rows.append(cov_tbl)
+            cov_tbl = self._coverage_for_window(backfill, val_item_cnt)
+            cov_tbl["window"] = int(W)
+            cov_rows.append(cov_tbl)
 
         metrics_recall = pd.concat(metrics_rows, ignore_index=True) if metrics_rows else pd.DataFrame()
         metrics_cov = pd.concat(cov_rows, ignore_index=True) if cov_rows else None
@@ -236,6 +265,17 @@ class Exp102DailyTrending(BaseExperiment):
         save_df(path, df, index=False)
         log_artifact(path, name=f"{self.exp_name}_daytops_W{W}", type_="dataset")
         return path
+
+    def _coverage_for_window(self, global_top: Sequence[int], val_item_cnt: pd.Series) -> pd.DataFrame:
+        ks = [int(k) for k in self.cfg.coverage_ks]
+        if not global_top:
+            return pd.DataFrame({"K": ks, "coverage": [0.0 for _ in ks]})
+        scores = pd.Series(
+            data=np.linspace(len(global_top), 1, num=len(global_top)),
+            index=pd.Index([int(it) for it in global_top], name=COL_ITEM),
+            name="score",
+        )
+        return coverage_at_k(scores, val_item_cnt, ks=ks)
 
     @staticmethod
     def _assemble_metrics_df(metrics_recall: pd.DataFrame, metrics_cov: Optional[pd.DataFrame]) -> pd.DataFrame:

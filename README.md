@@ -1,58 +1,121 @@
 # Vseros_B – RecSys experimentation toolkit
 
 ## Overview
-This repository hosts a recommendation-system experimentation stack for the Vseros_B Stage 1 recall track. It focuses on generating top‑20 candidate items for each user based on historical click logs provided by T‑Bank. The codebase is centred around a reusable `BaseExperiment` abstraction that orchestrates loading data, fitting models (where required), generating candidate lists, computing recall metrics, and persisting artefacts.
 
-### Dataset snapshot
-- **train_data.pq** – 47 days of user–item interactions; the historical split used for training/validation.
-- **sample_submission.csv** – template listing all target users; for each, the system must return 20 predicted item IDs.
-- **Task** – predict the items a user will click during the final 7‑day horizon immediately after the training period.
-- **Metric** – mean Average Precision at 20 (mAP@20).
+This repository contains a modular experimentation stack for the Vseros_B Stage 1
+recall track. It focuses on building reproducible candidate generators and
+rankers that deliver top-20 recommendations for every user. The codebase is
+centred around a reusable `BaseExperiment` abstraction which orchestrates data
+loading, fitting, candidate generation, evaluation, and artefact persistence.
 
-### Repository layout
+## Repository layout
+
 ```
-├── notebooks/               # ad‑hoc exploration reports
-└── src/vseros_b/
-    ├── base_exp.py          # BaseExperiment with fit/candidates/evaluate/save lifecycle
-    ├── config.py            # central configuration (paths, run modes, defaults)
-    ├── data.py              # data loading, caching, splits
-    ├── artifacts.py         # artefact management helpers
-    ├── metrics.py           # recall/precision/NDCG metrics
-    ├── pop_decay.py, trending.py, covis.py, ...
-    ├── exp10x_*.py          # concrete experiment definitions (popularity, trending, covisitation,
-    │                        # item2vec, LightGCN import, Personalized PageRank, recall fusion, …)
-    └── utils (various)      # supporting algorithm-specific utilities
+vseros_b/
+├─ pyproject.toml              # project metadata and formatting rules
+├─ requirements.txt            # Kaggle-friendly dependency lock
+├─ README.md
+├─ CONTRIBUTING.md             # contribution guidelines
+├─ VERSION                     # exported package version (used in W&B runs)
+├─ src/
+│  └─ vseros_b/
+│     ├─ __init__.py
+│     ├─ config.py             # column names, paths, quick-mode toggles
+│     ├─ artifacts.py          # artefact I/O + W&B helpers
+│     ├─ metrics.py
+│     ├─ base_exp.py
+│     ├─ data.py               # load_and_prepare()
+│     ├─ registry/
+│     │  ├─ __init__.py        # central experiment registry
+│     │  └─ default.py         # default experiment registrations
+│     ├─ features/             # feature generation building blocks
+│     │  ├─ __init__.py
+│     │  ├─ builders.py
+│     │  ├─ sources.py
+│     │  ├─ embeddings.py
+│     │  └─ schema.py
+│     ├─ candidates/           # candidate generators
+│     │  ├─ pop_decay.py, trending.py, covis.py, item2vec_lite.py, ppr.py, …
+│     ├─ exps/                 # experiment implementations
+│     │  ├─ exp101_pop_decay.py
+│     │  ├─ …
+│     │  └─ exp108_recall_fusion.py
+│     └─ utils/
+│        ├─ logging.py
+│        └─ seeds.py
+├─ notebooks/
+│  ├─ orchestrator.ipynb
+│  └─ lightgcn_train.ipynb
+├─ scripts/
+│  ├─ bootstrap_kaggle.py
+│  └─ check_env.py
+└─ .pre-commit-config.yaml
 ```
-Each `exp10x_*` module subclasses `BaseExperiment` and encapsulates the workflow for a single candidate generator. Results, metrics, and auxiliary data are saved through `artifacts.py`, making runs reproducible and shareable.
 
-## Suggested improvements to streamline experimentation
+## Configuration
 
-### 1. Package structure
-- Split `src/vseros_b` into subpackages (e.g. `data/`, `experiments/`, `models/`, `pipelines/`, `utils/`) to clarify responsibilities and reduce module length.
-- Expose experiment classes through an `experiments/registry.py` to enable dynamic lookup (`get_experiment("exp105_item2vec")`).
+All runtime paths are controlled from `config.py`. The defaults assume the
+following layout relative to the project root:
 
-### 2. Configuration management
-- Migrate the current config module to structured configs (Pydantic, dataclasses, or Hydra/OmegaConf) with YAML overrides. This would simplify quick parameter sweeps, artifact naming, and reproducibility.
+```
+./data/train_data.pq
+./data/sample_submission.csv
+./artifacts/
+```
 
-### 3. Unified CLI entrypoint
-- Provide a single CLI (`python -m vseros_b.run --exp exp105_item2vec --config confs/item2vec.yaml --mode quick`) that triggers the full lifecycle.
-- Bundle typical experiment sequences (train → generate → evaluate) into reusable “playbooks.”
+Set the `VSEROS_B_*` environment variables to override any path, for example:
 
-### 4. Artefact conventions
-- Extend `artifacts.py` to standardize directory layout: `${ARTIFACT_ROOT}/{experiment}/{run_id}/{stage}` with metadata (timestamp, parameters, git SHA) for reproducibility.
-- Add utilities to list previous runs, load the latest artefacts, and compare metrics across experiments.
+```bash
+export VSEROS_B_DATA_DIR=/kaggle/input/vseros-data
+export VSEROS_B_ARTIFACT_DIR=/kaggle/working/artifacts
+```
 
-### 5. Metrics and benchmarking
-- Centralize evaluation by wrapping `metrics.py` in a service that can benchmark multiple experiments on the same split and produce dashboards/tables.
-- Track summary statistics (coverage, diversity) alongside mAP@20.
+Running `vseros_b.artifacts.ensure_project_dirs()` or invoking
+`load_and_prepare()` will create the required directories.
 
-### 6. Documentation and onboarding
-- Flesh out module-level docstrings describing data expectations, caching scheme, and experiment contracts.
-- Provide quick-start instructions: where to place datasets, how to run the baseline experiment, and how to contribute new candidate generators.
-- Maintain a changelog or roadmap capturing tested hypotheses and planned improvements.
+## Quick start
 
-### 7. Quality gates
-- Introduce type checking (`mypy`) and linting (`ruff`/`flake8`) to keep experiments consistent and catch regressions early.
-- Prepare smoke tests (e.g. via `pytest`) that instantiate each experiment in quick mode to ensure dependency sanity.
+1. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. Prepare the dataset (copy `train_data.pq` and `sample_submission.csv` into
+   the configured data directory).
+3. Load data and run a baseline experiment inside a Python session or notebook:
+   ```python
+   from pathlib import Path
 
-These refinements should make the platform more maintainable, accelerate iterative experimentation, and ease collaboration among teammates.
+   from vseros_b import registry
+   from vseros_b.data import load_and_prepare
+
+   context = load_and_prepare()
+   exp_cls = registry.get("exp101_pop_decay")
+   experiment = exp_cls()
+   experiment.fit(context)
+   metrics = experiment.evaluate(context)
+   print(metrics.head())
+   ```
+4. Artefacts and metrics will appear under `artifacts/` as defined by the
+   configuration.
+
+## Adding new experiments
+
+- Implement the experiment in `src/vseros_b/exps/` by subclassing
+  `BaseExperiment` and reusing helpers from `candidates/`, `features/`, and
+  `metrics.py`.
+- Register the experiment in `src/vseros_b/registry/default.py` so that it is
+  available through the dynamic registry API.
+- Document any additional dependencies in `requirements.txt` if they are needed
+  for Kaggle submissions.
+
+## Tooling
+
+- Formatting and linting are enforced via `.pre-commit-config.yaml`
+  (Black, isort, Flake8, trailing whitespace).
+- The package exposes its semantic version through the `VERSION` file and the
+  `vseros_b.__version__` attribute.
+- Scripts under `scripts/` provide convenience entry points for Kaggle/Colab
+  environments (`bootstrap_kaggle.py`) and quick environment diagnostics
+  (`check_env.py`).
+
+Happy experimenting!

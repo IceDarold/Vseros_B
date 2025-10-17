@@ -23,8 +23,8 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from .config import COL_USER, COL_ITEM, COL_DATE, CAND_TOP_M_PER_USER
-from .metrics import recall_at_m
+from ..config import COL_USER, COL_ITEM, COL_DATE, CAND_TOP_M_PER_USER
+from ..metrics import recall_at_m
 
 
 # ============================ базовые агрегаты ============================

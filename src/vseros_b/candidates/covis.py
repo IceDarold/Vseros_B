@@ -18,10 +18,14 @@ import numpy as np
 import pandas as pd
 from itertools import combinations
 
-from .config import (
-    COL_USER, COL_ITEM, COL_DATE,
-    DECAY_LAMBDA_COVIS, TOPN_NEIGHBORS_PER_ITEM,
-    K_RECENT_ITEMS_PER_USER, CAND_TOP_M_PER_USER,
+from ..config import (
+    COL_USER,
+    COL_ITEM,
+    COL_DATE,
+    DECAY_LAMBDA_COVIS,
+    TOPN_NEIGHBORS_PER_ITEM,
+    K_RECENT_ITEMS_PER_USER,
+    CAND_TOP_M_PER_USER,
     COVIS_MIN_PAIR_COUNT,
 )
 
