@@ -31,7 +31,7 @@ from .config import (
 from .artifacts import ensure_dir, save_df, log_artifact
 from .trending import (
     build_val_day_toplists,
-    candidates_from_day_tops,
+    candidates_from_day_toplists,
     evaluate_trending_candidates,
     coverage_from_frozen_trending,
     trending_global_from_last_train_window,
