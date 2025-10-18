@@ -1,355 +1,229 @@
 # -*- coding: utf-8 -*-
 """
-trending.py — дневные тренды без утечек + утилиты для кандидатов и оценки.
+Trending helpers for day-based validation/test without leakage.
 
-Что здесь:
-- build_val_day_toplists: пер-дневные топы на вал-диапазон (считаются ТОЛЬКО по train-окну)
-- candidates_from_day_toplists: преобразование пер-дневных топов в per-user кандидатов
-- evaluate_trending_candidates: оценка recall@M для таких кандидатов
-- coverage_from_frozen_trending: покрытие пользователей и длины листов (frozen-тренды)
-- trending_global_from_last_train_window: глобальный тренд по последнему train-окну
-- user_first_val_day, day_item_counts — служебные
+Колонки датасета:
+  - user_id, item_id, day  (day — целое число, 0..N)
 
-Зависимости проекта:
-- .config: COL_USER, COL_ITEM, COL_DATE, CAND_TOP_M_PER_USER
-- .metrics: recall_at_m
-- (опционально) .pop_decay: compute_pop_static, build_global_top — если нужен бэкфилл
+Что здесь есть:
+  • build_val_day_toplists(train_df, val_start, val_end, ...)
+      Для каждого дня d в [val_start, val_end] строит топ-список айтемов
+      из скользящего окна прошлых дней [d-window_days, d-1] без утечки.
+
+  • candidates_from_day_toplists(toplists_by_day, user_day_map, k_top)
+      Превращает day→top_items в user→top_items, используя отображение user→day.
+
+  • evaluate_trending_candidates(cand_map, truth, k_list)
+      Считает HR@k / NDCG@k для мапы кандидатов (user→список item_id).
+
+  • coverage_from_frozen_trending(train_df, truth, users, window_days, k_top)
+      Быстрая проверка «замороженного» трендинга (один общий список для всех),
+      возвращает метрики и coverage.
+
+  • trending_global_from_last_train_window(train_df, last_window_days, topk)
+      Глобальный топ айтемов из последних W дней train.
+
+Примечания:
+  - Никаких внешних зависимостей кроме pandas/numpy.
+  - Безопасно к пустым окнам: если в окне нет событий, вернётся пустой список.
 """
 
 from __future__ import annotations
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 from dataclasses import dataclass
+from typing import Dict, List, Sequence, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-from .config import COL_USER, COL_ITEM, COL_DATE, CAND_TOP_M_PER_USER
-from .metrics import recall_at_m
+from vseros_b.config import COL_USER, COL_ITEM, COL_DATE
+from vseros_b.metrics import recall_at_m, ndcg_at_k
 
 
-# ============================ базовые агрегаты ============================
+# ---------------------------------------------------------------------------
+# Вспомогалки
+# ---------------------------------------------------------------------------
 
-def day_item_counts(df: pd.DataFrame) -> pd.DataFrame:
+def _top_items_in_window(df: pd.DataFrame,
+                         lo_day: int,
+                         hi_day: int,
+                         min_count: int = 1,
+                         topk: Optional[int] = None) -> List[int]:
     """
-    Подсчёт частот по (день, item_id).
-    Возвращает DataFrame: [day, item_id, cnt]
+    Берёт срез по дням [lo_day, hi_day] включительно и возвращает
+    список item_id по убыванию частоты.
     """
-    if not {COL_DATE, COL_ITEM}.issubset(df.columns):
-        raise ValueError(f"df must have [{COL_DATE}, {COL_ITEM}]")
-    out = (
-        df.groupby([COL_DATE, COL_ITEM], as_index=False)
-          .size()
-          .rename(columns={"size": "cnt"})
-    )
-    return out[[COL_DATE, COL_ITEM, "cnt"]]
+    if lo_day > hi_day:
+        return []
+    mask = (df[COL_DATE] >= int(lo_day)) & (df[COL_DATE] <= int(hi_day))
+    if not mask.any():
+        return []
+    cnt = (df.loc[mask, [COL_ITEM, COL_USER]]
+             .groupby(COL_ITEM, sort=False)[COL_USER]
+             .count()
+             .astype("int64"))
+    if len(cnt) == 0:
+        return []
+    if min_count > 1:
+        cnt = cnt[cnt >= int(min_count)]
+        if len(cnt) == 0:
+            return []
+    order = cnt.sort_values(ascending=False).index.values.tolist()
+    if topk is not None and len(order) > int(topk):
+        order = order[:int(topk)]
+    return list(map(int, order))
 
 
-# ============================ пер-дневные топы (без утечек) ============================
-
-def build_val_day_toplists(
-    train_df: pd.DataFrame,
-    split,
-    window_days: int = 14,
-    topk_per_day: int = 1000,
-    min_item_freq: int = 1,
-    decay_lambda: float = 0.0,
-) -> Dict[int, List[int]]:
-    """
-    Для каждого дня валидации d строит топ items на основе популярности в скользящем окне
-    [d - window_days, d - 1], ИСКЛЮЧИТЕЛЬНО по TRAIN-окну (без утечек).
-
-    Параметры:
-      - train_df: DataFrame с колонками [user_id, item_id, day] и ТОЛЬКО train-днями
-      - split: объект со свойствами train_end, val_start, val_end
-      - window_days: ширина скользящего окна в днях
-      - topk_per_day: длина итогового топ-листа на день
-      - min_item_freq: фильтр минимальной частоты/веса
-      - decay_lambda: если >0, применяет экспоненциальный decay по "возрасту" дня:
-            w = exp(-λ * (right - day)), где right = d-1
-
-    Возвращает:
-      { day(int) -> [item_id, ...] } длиной до topk_per_day
-    """
-    if train_df.empty:
-        return {}
-
-    di = day_item_counts(train_df)  # [day, item_id, cnt]
-    val_days = list(range(int(split.val_start), int(split.val_end) + 1))
-    dmin_train = int(train_df[COL_DATE].min())
-    dmax_train = int(split.train_end)
-
-    out: Dict[int, List[int]] = {}
-    for d in val_days:
-        left = max(d - int(window_days), dmin_train)
-        right = min(d - 1, dmax_train)
-        if right < left:
-            out[d] = []
-            continue
-
-        win = di[(di[COL_DATE] >= left) & (di[COL_DATE] <= right)]
-        if win.empty:
-            out[d] = []
-            continue
-
-        if decay_lambda and decay_lambda > 0.0:
-            age = (right - win[COL_DATE]).astype(float).clip(lower=0)
-            w = np.exp(-float(decay_lambda) * age)
-            tmp = (
-                win.assign(w=w * win["cnt"])
-                   .groupby(COL_ITEM, as_index=False)["w"].sum()
-                   .rename(columns={"w": "score"})
-            )
-        else:
-            tmp = (
-                win.groupby(COL_ITEM, as_index=False)["cnt"].sum()
-                   .rename(columns={"cnt": "score"})
-            )
-
-        tmp = tmp[tmp["score"] >= float(min_item_freq)]
-        if tmp.empty:
-            out[d] = []
-            continue
-
-        tmp = tmp.sort_values("score", ascending=False)
-        items = tmp[COL_ITEM].astype("int64").head(int(topk_per_day)).tolist()
-        out[d] = items
-
+def _ensure_int_cols(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out[COL_USER] = out[COL_USER].astype("int64")
+    out[COL_ITEM] = out[COL_ITEM].astype("int64")
+    out[COL_DATE] = out[COL_DATE].astype("int32")
     return out
 
 
-# ============================ утилиты для user→day и кандидатов ============================
+# ---------------------------------------------------------------------------
+# 1) Day→TopList (валидационное построение без утечки)
+# ---------------------------------------------------------------------------
 
-def user_first_val_day(val_df: pd.DataFrame) -> Dict[int, int]:
+def build_val_day_toplists(train_df: pd.DataFrame,
+                           val_start: int,
+                           val_end: int,
+                           window_days: int = 3,
+                           topk_per_day: int = 1000,
+                           min_count: int = 1) -> Dict[int, List[int]]:
     """
-    Возвращает карту {user_id -> первый день появления в валидации}.
-    Если у пользователя несколько вал-дней, берём минимальный (ранний).
+    Для каждого дня d ∈ [val_start, val_end] строит топ-список айтемов,
+    считая частоту по окну [d - window_days, d - 1].
+    Никакой утечки: день d НЕ входит в окно.
+
+    Возврат:
+      dict: day -> List[item_id] (длина ≤ topk_per_day)
     """
-    if not {COL_USER, COL_DATE}.issubset(val_df.columns):
-        raise ValueError(f"val_df must have [{COL_USER}, {COL_DATE}]")
-    x = (
-        val_df.groupby(COL_USER, as_index=False)[COL_DATE]
-              .min()
-              .rename(columns={COL_DATE: "first_val_day"})
-    )
-    return {int(r[COL_USER]): int(r["first_val_day"]) for _, r in x.iterrows()}
+    df = _ensure_int_cols(train_df)
+    toplists: Dict[int, List[int]] = {}
+    for d in range(int(val_start), int(val_end) + 1):
+        lo = d - int(window_days)
+        hi = d - 1
+        items = _top_items_in_window(df, lo, hi, min_count=min_count, topk=int(topk_per_day))
+        toplists[int(d)] = items
+    return toplists
 
 
-def candidates_from_day_toplists(
-    val_df: pd.DataFrame,
-    toplists: Mapping[int, Sequence[int]],
-    M: int = CAND_TOP_M_PER_USER,
-    backfill: Optional[Sequence[int]] = None,
-) -> Dict[int, List[int]]:
-    """
-    Собирает кандидатов per-user на основе пер-дневных топ-листов.
-    Для каждого пользователя выбирается его первый вал-день, и выдаются top-M айтемов
-    из соответствующего дневного топа. Если для дня список пуст — подставляется backfill.
+# ---------------------------------------------------------------------------
+# 2) DayToplists → User candidates
+# ---------------------------------------------------------------------------
 
-    Возвращает:
-      {user_id -> [item_id1, ...]}
+def candidates_from_day_toplists(toplists_by_day: Dict[int, List[int]],
+                                 user_day_map: Dict[int, int],
+                                 k_top: int = 20) -> Dict[int, List[int]]:
     """
-    u2day = user_first_val_day(val_df)
+    Превращает day→top_items в user→top_items, используя user→day мап.
+
+    user_day_map: user_id -> day (день, на который делаем предсказание для этого пользователя)
+    k_top: сколько верхних взять из топлиста дня
+
+    Вернёт:
+      user2items: dict user_id -> List[item_id]
+    """
     out: Dict[int, List[int]] = {}
-    M = int(M)
-
-    for u, d in u2day.items():
-        items = toplists.get(int(d), [])
-        if items:
-            out[int(u)] = list(map(int, items[:M]))
-        else:
-            out[int(u)] = list(map(int, (backfill or [])[:M]))
+    for u, d in user_day_map.items():
+        items = toplists_by_day.get(int(d), [])
+        out[int(u)] = list(map(int, items[:int(k_top)]))
     return out
 
 
-# ============================ оценка и покрытия ============================
+# ---------------------------------------------------------------------------
+# 3) Оценка кандидатов трендинга
+# ---------------------------------------------------------------------------
 
-def evaluate_trending_candidates(
-    val_truth: Mapping[int, set],
-    cand_map: Mapping[int, Sequence[int]],
-    M_list: Sequence[int] = (50, 100, 200, 500, 1000),
-    averaging: str = "micro",
-) -> pd.DataFrame:
+def evaluate_trending_candidates(cand_map: Dict[int, List[int]],
+                                 truth: Dict[int, set],
+                                 k_list: Sequence[int] = (20, 50, 100)) -> pd.DataFrame:
     """
-    Оценивает recall@M для готовых trending-кандидатов.
-    Ожидается, что и val_truth, и cand_map — в item_id (сырых).
+    cand_map: user -> ranked list of items
+    truth:    user -> set of true items (в валидационном периоде)
     """
+    # фильтруем до тех u, у кого есть кандидаты и правда
+    users = sorted(set(cand_map.keys()) & set(truth.keys()))
+    sub = {u: cand_map[u] for u in users}
+    gt  = {u: truth[u] for u in users}
+
     rows = []
-    for m in M_list:
-        r = recall_at_m(val_truth, cand_map, m=int(m), averaging=averaging)
-        rows.append({"M": int(m), "recall": float(r)})
+    for k in k_list:
+        rows.append({
+            "k": int(k),
+            "HR@k": float(recall_at_m(sub, gt, m=int(k))),
+            "NDCG@k": float(ndcg_at_k(sub, gt, k=int(k))),
+            "users_eval": int(len(users)),
+        })
     return pd.DataFrame(rows)
 
 
-def coverage_from_frozen_trending(
-    val_df: pd.DataFrame,
-    toplists: Mapping[int, Sequence[int]],
-    cand_map: Optional[Mapping[int, Sequence[int]]] = None,
-) -> Tuple[dict, pd.DataFrame]:
+# ---------------------------------------------------------------------------
+# 4) Frozen-trending coverage (один общий топ для всех)
+# ---------------------------------------------------------------------------
+
+def coverage_from_frozen_trending(train_df: pd.DataFrame,
+                                  truth: Dict[int, set],
+                                  users: Optional[Sequence[int]] = None,
+                                  last_window_days: int = 3,
+                                  k_top: int = 20,
+                                  min_count: int = 1) -> Tuple[Dict[int, List[int]], pd.DataFrame]:
     """
-    Считает покрытие по пользователям и длины списков для frozen-трендов.
-    - Общая сводка: % пользователей с ненулевым листом, средняя/медианная длины списков.
-    - Пер-дневная сводка: сколько пользователей "падает" на день d, и какой длины там топ-лист.
-
-    Параметры:
-      - val_df: валидация
-      - toplists: {day -> [item_id, ...]} — пер-дневные топы
-      - cand_map: {user_id -> [item_id, ...]} — уже собранные кандидаты (необязательно)
-                  если не задан — будет собран по toplists с M = длина списка дня (без бэкфилла)
-
-    Возвращает:
-      (summary_dict, per_day_df)
+    Строит один общий топ из последних W дней train и выдаёт его всем пользователям.
+    Возвращает (cand_map, metrics_df).
     """
-    if not {COL_USER, COL_DATE}.issubset(val_df.columns):
-        raise ValueError(f"val_df must have [{COL_USER}, {COL_DATE}]")
+    df = _ensure_int_cols(train_df)
+    max_day = int(df[COL_DATE].max())
+    lo = max_day - int(last_window_days) + 1
+    global_top = _top_items_in_window(df, lo, max_day, min_count=min_count, topk=int(k_top))
 
-    # кому какой день
-    u2day = user_first_val_day(val_df)
-    per_day = (
-        pd.DataFrame({COL_USER: list(u2day.keys()), COL_DATE: list(u2day.values())})
-          .groupby(COL_DATE, as_index=False)
-          .size()
-          .rename(columns={"size": "users_on_day"})
-    )
-    # длина топ-листа в каждый день
-    day_len = pd.DataFrame({
-        COL_DATE: list(toplists.keys()),
-        "toplist_len": [len(v) for v in toplists.values()]
-    })
-    per_day = per_day.merge(day_len, on=COL_DATE, how="left").fillna({"toplist_len": 0})
+    if users is None:
+        users = sorted(truth.keys())
 
-    # если cand_map не дан — соберём "как есть" (без бэкфилла)
-    if cand_map is None:
-        tmp_cand: Dict[int, List[int]] = {}
-        for u, d in u2day.items():
-            items = toplists.get(int(d), [])
-            tmp_cand[int(u)] = list(map(int, items))
-        cand_map = tmp_cand
-
-    # покрытие и длины
-    lens = [len(cand_map.get(int(u), [])) for u in u2day.keys()]
-    users_total = len(lens)
-    covered = sum(1 for L in lens if L > 0)
-    summary = {
-        "users_total": users_total,
-        "users_with_list": covered,
-        "coverage_pct": 100.0 * covered / max(1, users_total),
-        "avg_list_len": float(np.mean(lens)) if lens else 0.0,
-        "p50_list_len": float(np.percentile(lens, 50)) if lens else 0.0,
-        "p90_list_len": float(np.percentile(lens, 90)) if lens else 0.0,
-    }
-
-    return summary, per_day.sort_values(COL_DATE).reset_index(drop=True)
+    cand_map = {int(u): list(global_top) for u in users}
+    metrics = evaluate_trending_candidates(cand_map, truth, k_list=(k_top,))  # логично посчитать хотя бы @k_top
+    # добавим простые coverage-показатели
+    item_coverage = len(set().union(*[set(v) for v in cand_map.values()])) if cand_map else 0
+    user_coverage = sum(1 for u in users if len(cand_map.get(int(u), [])) > 0)
+    metrics["item_coverage"] = int(item_coverage)
+    metrics["user_coverage"] = int(user_coverage)
+    metrics["global_top_size"] = int(len(global_top))
+    return cand_map, metrics
 
 
-# ============================ глобальный тренд по последнему train-окну ============================
+# ---------------------------------------------------------------------------
+# 5) Глобальный трендинг из последнего окна train
+# ---------------------------------------------------------------------------
 
-def trending_global_from_last_train_window(
-    train_df: pd.DataFrame,
-    split,
-    window_days: int = 14,
-    topk: int = 1000,
-    min_item_freq: int = 1,
-    decay_lambda: float = 0.0,
-) -> List[int]:
+def trending_global_from_last_train_window(train_df: pd.DataFrame,
+                                           last_window_days: int = 3,
+                                           topk: int = 1000,
+                                           min_count: int = 1) -> List[int]:
     """
-    Глобальный тренд без утечек: считаем популярность по последним `window_days`
-    TRAIN-дням (интервал [train_end - window_days + 1, train_end]) и отдаём топ-список.
-
-    Можно потом использовать как backfill для дневных трендов/кандидатов.
+    Возвращает глобальный список трендинга по последним W дням train.
     """
-    if train_df.empty:
-        return []
+    df = _ensure_int_cols(train_df)
+    max_day = int(df[COL_DATE].max())
+    lo = max_day - int(last_window_days) + 1
+    return _top_items_in_window(df, lo, max_day, min_count=min_count, topk=int(topk))
 
-    end_day = int(split.train_end)
-    start_day = max(int(train_df[COL_DATE].min()), end_day - int(window_days) + 1)
 
-    x = train_df[(train_df[COL_DATE] >= start_day) & (train_df[COL_DATE] <= end_day)]
-    if x.empty:
-        return []
+# ---------------------------------------------------------------------------
+# (опционально) Вспомогалка: построить user→day map из вал.таблицы
+# ---------------------------------------------------------------------------
 
-    di = day_item_counts(x)
+def build_user_day_map(val_df: pd.DataFrame, policy: str = "min") -> Dict[int, int]:
+    """
+    Полезно для exp102: по валидационной выборке собрать отображение user→day.
 
-    if decay_lambda and decay_lambda > 0.0:
-        # чем свежее день, тем больше вес
-        age = (end_day - di[COL_DATE]).astype(float).clip(lower=0)
-        w = np.exp(-float(decay_lambda) * age)
-        tmp = (
-            di.assign(w=w * di["cnt"])
-              .groupby(COL_ITEM, as_index=False)["w"].sum()
-              .rename(columns={"w": "score"})
-        )
+    policy:
+      - "min": берём минимальный day пользователя в вал.окне (первое появление);
+      - "max": берём максимальный day (последнее появление).
+    """
+    df = _ensure_int_cols(val_df)
+    if policy == "max":
+        agg = df.groupby(COL_USER, sort=False)[COL_DATE].max().astype("int32")
     else:
-        tmp = (
-            di.groupby(COL_ITEM, as_index=False)["cnt"].sum()
-              .rename(columns={"cnt": "score"})
-        )
-
-    tmp = tmp[tmp["score"] >= float(min_item_freq)]
-    if tmp.empty:
-        return []
-
-    tmp = tmp.sort_values("score", ascending=False)
-    return tmp[COL_ITEM].astype("int64").head(int(topk)).tolist()
-
-
-# ============================ «всё-в-одном» (быстрый конвейер) ============================
-
-def build_trending_candidates(
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    split,
-    window_days: int = 14,
-    M: int = CAND_TOP_M_PER_USER,
-    min_item_freq: int = 1,
-    decay_lambda: float = 0.0,
-    backfill_with_global_top: bool = True,
-    backfill_K: int = 3000,
-) -> Tuple[Dict[int, List[int]], Dict[int, List[int]]]:
-    """
-    Быстрый конвейер:
-      1) строит per-day toplists для вал-окна (по TRAIN),
-      2) собирает per-user кандидатов из топ-листа соответствующего вал-дня,
-      3) (опц.) бэкфиллит пустых пользователей глобальным топом.
-
-    Возврат:
-      (candidates_map, toplists_map)
-    """
-    toplists = build_val_day_toplists(
-        train_df=train_df,
-        split=split,
-        window_days=window_days,
-        topk_per_day=max(M, 1000),
-        min_item_freq=min_item_freq,
-        decay_lambda=decay_lambda,
-    )
-
-    backfill = None
-    if backfill_with_global_top:
-        backfill = trending_global_from_last_train_window(
-            train_df=train_df,
-            split=split,
-            window_days=window_days,
-            topk=max(backfill_K, M),
-            min_item_freq=min_item_freq,
-            decay_lambda=decay_lambda,
-        )
-
-    cand = candidates_from_day_toplists(
-        val_df=val_df,
-        toplists=toplists,
-        M=M,
-        backfill=backfill,
-    )
-    return cand, toplists
-
-
-__all__ = [
-    "day_item_counts",
-    "build_val_day_toplists",
-    "user_first_val_day",
-    "candidates_from_day_toplists",
-    "evaluate_trending_candidates",
-    "coverage_from_frozen_trending",
-    "trending_global_from_last_train_window",
-    "build_trending_candidates",
-]
+        agg = df.groupby(COL_USER, sort=False)[COL_DATE].min().astype("int32")
+    return {int(u): int(d) for u, d in agg.items()}
