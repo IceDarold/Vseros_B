@@ -1,8 +1,8 @@
 # Kaggle runtime configuration for Vseros_B pipeline.
 # Update the dataset paths and W&B artifact refs to match your environment.
 paths:
-  train_path: /kaggle/input/vseros-b/train_data.pq
-  sample_path: /kaggle/input/vseros-b/sample_submission.csv
+  train_path: /kaggle/input/vseros-recsys-osn/train_data.pq
+  sample_path: /kaggle/input/vseros-recsys-osn/sample_submission.csv
   artifact_dir: artifacts
   interm_dir: artifacts/intermediates
   cand_dir: artifacts/candidates
