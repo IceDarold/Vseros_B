@@ -28,14 +28,14 @@ import json
 import numpy as np
 import pandas as pd
 
-from .base_exp import BaseExperiment
-from .config import (
+from ..base_exp import BaseExperiment
+from ..config import (
     PATHS, COL_USER, COL_ITEM,
     CAND_TOP_M_PER_USER, QUICK_MODE, QUICK_USERS, SEED,
 )
-from .artifacts import ensure_dir, save_df, log_artifact
-from .metrics import recall_at_m
-from .pop_decay import compute_pop_static, build_global_top
+from ..artifacts import ensure_dir, save_df, log_artifact
+from ..metrics import recall_at_m
+from ..pop_decay import compute_pop_static, build_global_top
 
 
 # ----------------------------- Утилиты загрузки/парсинга -----------------------------
