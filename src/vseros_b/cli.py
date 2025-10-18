@@ -220,11 +220,10 @@ def instantiate_experiment(name: str, cfg_overrides: Optional[Mapping[str, Any]]
         # Try passing verbose flag if constructor expects it
         instance = cls(cfg_instance, verbose=verbose) if cfg_instance is not None else cls(verbose=verbose)
 
-    if hasattr(instance, "verbose"):
-        try:
-            setattr(instance, "verbose", verbose)
-        except Exception:
-            pass
+    try:
+        setattr(instance, "verbose", verbose)
+    except Exception:
+        pass
     return instance
 
 

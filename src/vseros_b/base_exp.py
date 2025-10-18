@@ -65,6 +65,7 @@ class BaseExperiment(ABC):
         self.seed = int(seed)
         self.rng = np.random.default_rng(self.seed)
         self.io = ExpIO.make(exp_name)
+        self.verbose: bool = False
         self._state: Dict[str, Any] = {}  # гибкий карман для состояний наследника
 
     # ---------- обязательные методы, которые должны реализовать наследники ----------
