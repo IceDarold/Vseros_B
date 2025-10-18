@@ -39,6 +39,12 @@ from .metrics import recall_at_m
 from .covis import (
     neighbors_to_map, last_k_items_by_user, candidates_from_covis,
 )
+try:
+    from ..covis2_gpu import build_two_hop_gpu  # type: ignore
+    _GPU_AVAILABLE = True
+except Exception:
+    build_two_hop_gpu = None  # type: ignore
+    _GPU_AVAILABLE = False
 
 # ----------------------------- Конфиг и состояние -----------------------------
 
@@ -70,6 +76,7 @@ class Exp104Config:
     quick_mode: bool = QUICK_MODE
     quick_users: Optional[int] = QUICK_USERS
     seed: int = SEED
+    use_gpu: bool = _GPU_AVAILABLE
 
 
 @dataclass
@@ -107,10 +114,30 @@ class Exp104CoVis2Hop(BaseExperiment):
             raise FileNotFoundError("Не удалось найти артефакт 1-hop соседей (exp103). Убедись, что exp103 выполнен.")
 
         # 2-hop
-        nei2 = self._build_two_hop(nei1, gamma=self.cfg.gamma,
-                                   branch_topn=self.cfg.branch_topn,
-                                   topn_second=self.cfg.topn_second_order,
-                                   drop_self=self.cfg.drop_self)
+        nei2 = None
+        if self.cfg.use_gpu and _GPU_AVAILABLE and build_two_hop_gpu is not None:
+            try:
+                nei2 = build_two_hop_gpu(
+                    nei1,
+                    gamma=self.cfg.gamma,
+                    branch_topn=self.cfg.branch_topn,
+                    topn_second=self.cfg.topn_second_order,
+                    drop_self=self.cfg.drop_self,
+                )
+                if self.verbose:
+                    print(f"[{self.exp_name}] GPU two-hop succeeded (rows={len(nei2):,})")
+            except Exception as exc:
+                if self.verbose:
+                    print(f"[{self.exp_name}] GPU two-hop failed ({exc}); falling back to CPU.")
+                nei2 = None
+
+        if nei2 is None:
+            nei2 = self._build_two_hop(nei1, gamma=self.cfg.gamma,
+                                       branch_topn=self.cfg.branch_topn,
+                                       topn_second=self.cfg.topn_second_order,
+                                       drop_self=self.cfg.drop_self)
+            if self.verbose and self.cfg.use_gpu:
+                print(f"[{self.exp_name}] CPU two-hop used (rows={len(nei2):,})")
 
         # смешиваем 1-hop и 2-hop
         comb = self._combine_nei(nei1, nei2,
