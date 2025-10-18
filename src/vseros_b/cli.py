@@ -910,27 +910,32 @@ def command_report(args: argparse.Namespace, cfg: Mapping[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Vseros_B pipeline CLI")
-    parser.add_argument("--config", type=Path, default=None, help="YAML config with overrides.")
-    parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
-    parser.add_argument("--run-id", type=str, default=None, help="Optional identifier for the W&B run and manifest.")
-    parser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging.")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--config", type=Path, default=argparse.SUPPRESS, help="YAML config with overrides.")
+    common.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS, help="Enable debug logging.")
+    common.add_argument("--run-id", type=str, default=argparse.SUPPRESS, help="Optional identifier for the W&B run and manifest.")
+    common.add_argument("--no-wandb", action="store_true", default=argparse.SUPPRESS, help="Disable Weights & Biases logging.")
 
+    parser = argparse.ArgumentParser(description="Vseros_B pipeline CLI", parents=[common])
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_prepare = sub.add_parser("prepare-data", help="Load and summarise the dataset.")
+    p_prepare = sub.add_parser("prepare-data", help="Load and summarise the dataset.", parents=[common], add_help=False)
+    p_prepare.add_argument("-h", "--help", action="help")
     p_prepare.add_argument("--format", type=str, default=None, help="Explicit file format for the train data.")
     p_prepare.add_argument("--output", type=str, default=None, help="Where to store summary JSON.")
     p_prepare.set_defaults(func=command_prepare_data)
 
-    p_build_cand = sub.add_parser("build-candidates", help="Run recall-source experiments.")
+    p_build_cand = sub.add_parser("build-candidates", help="Run recall-source experiments.", parents=[common], add_help=False)
+    p_build_cand.add_argument("-h", "--help", action="help")
     p_build_cand.add_argument("--experiments", nargs="+", help="Subset of experiments to run.")
     p_build_cand.set_defaults(func=command_build_candidates)
 
-    p_fuse = sub.add_parser("fuse-candidates", help="Merge candidate pools (exp108).")
+    p_fuse = sub.add_parser("fuse-candidates", help="Merge candidate pools (exp108).", parents=[common], add_help=False)
+    p_fuse.add_argument("-h", "--help", action="help")
     p_fuse.set_defaults(func=command_fuse_candidates)
 
-    p_features = sub.add_parser("build-features", help="Materialise feature matrices.")
+    p_features = sub.add_parser("build-features", help="Materialise feature matrices.", parents=[common], add_help=False)
+    p_features.add_argument("-h", "--help", action="help")
     p_features.add_argument("--cand-source", type=str, default=None, help="Candidate experiment to use (default: exp108_recall_fusion).")
     p_features.add_argument("--features", nargs="+", default=["all"], help="Feature names to include or 'all' for defaults.")
     p_features.add_argument("--out-tag", type=str, default="cli_run", help="Tag for feature artifacts.")
@@ -939,23 +944,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_features.add_argument("--dump-stats", type=str, default=None, help="Optional path to dump feature build stats JSON.")
     p_features.set_defaults(func=command_build_features)
 
-    p_ranks = sub.add_parser("train-ranker", help="Train ranker experiments.")
+    p_ranks = sub.add_parser("train-ranker", help="Train ranker experiments.", parents=[common], add_help=False)
+    p_ranks.add_argument("-h", "--help", action="help")
     p_ranks.add_argument("--experiments", nargs="+", help="Subset of ranker experiments to run.")
     p_ranks.set_defaults(func=command_train_ranker)
 
-    p_blend = sub.add_parser("blend", help="Run blend / rerank / fallback experiments.")
+    p_blend = sub.add_parser("blend", help="Run blend / rerank / fallback experiments.", parents=[common], add_help=False)
+    p_blend.add_argument("-h", "--help", action="help")
     p_blend.add_argument("--experiments", nargs="+", help="Subset of blend-stage experiments to run.")
     p_blend.set_defaults(func=command_blend)
 
-    p_rerank = sub.add_parser("rerank", help="Apply reranking / rule-based stages.")
+    p_rerank = sub.add_parser("rerank", help="Apply reranking / rule-based stages.", parents=[common], add_help=False)
+    p_rerank.add_argument("-h", "--help", action="help")
     p_rerank.add_argument("--experiments", nargs="+", help="Subset of rerank experiments to run.")
     p_rerank.set_defaults(func=command_rerank)
 
-    p_sub = sub.add_parser("make-submission", help="Build the final submission (defaults to exp304).")
+    p_sub = sub.add_parser("make-submission", help="Build the final submission (defaults to exp304).", parents=[common], add_help=False)
+    p_sub.add_argument("-h", "--help", action="help")
     p_sub.add_argument("--experiment", type=str, default=None, help="Specific experiment to run for submission.")
     p_sub.set_defaults(func=command_make_submission)
 
-    p_report = sub.add_parser("report", help="Show manifest summary and filesystem checks.")
+    p_report = sub.add_parser("report", help="Show manifest summary and filesystem checks.", parents=[common], add_help=False)
+    p_report.add_argument("-h", "--help", action="help")
     p_report.set_defaults(func=command_report)
 
     return parser
@@ -964,6 +974,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if not hasattr(args, "config"):
+        args.config = None
+    if not hasattr(args, "verbose"):
+        args.verbose = False
+    if not hasattr(args, "run_id"):
+        args.run_id = None
+    if not hasattr(args, "no_wandb"):
+        args.no_wandb = False
+
     configure_logging(verbose=args.verbose)
     cfg = load_yaml(args.config)
 
