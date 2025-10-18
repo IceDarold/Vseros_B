@@ -159,3 +159,21 @@ def coerce_dtypes(df: pd.DataFrame, feature_cols: Sequence[str]) -> pd.DataFrame
         elif meta.dtype.startswith("int"):
             out[c] = out[c].fillna(0).astype(meta.dtype)
     return out
+
+# В КОНЕЦ schema.py
+from typing import Iterable, Tuple, Sequence, Dict
+
+EXCLUDE_DEFAULT = ("user_id","item_id","day","label","y","target","click","purchase")
+
+def infer_schema_from_df(train_df: pd.DataFrame,
+                         exclude: Iterable[str] = EXCLUDE_DEFAULT
+                         ) -> Tuple[Sequence[str], Dict[str, dict]]:
+    """
+    Возвращает (feature_cols, schema_stats) для ranker-матрицы.
+    - выкидывает id/target-колонки,
+    - строит норм-схему через fit_norm_stats().
+    """
+    exclude = set(exclude)
+    feature_cols = [c for c in train_df.columns if c not in exclude]
+    stats = fit_norm_stats(train_df, feature_cols)
+    return feature_cols, stats
