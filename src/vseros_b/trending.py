@@ -85,51 +85,126 @@ def _ensure_int_cols(df: pd.DataFrame) -> pd.DataFrame:
 # 1) Day→TopList (валидационное построение без утечки)
 # ---------------------------------------------------------------------------
 
-def build_val_day_toplists(train_df: pd.DataFrame,
-                           val_start: int,
-                           val_end: int,
+from typing import Dict, List, Optional, Any
+from types import SimpleNamespace
+import numpy as np
+import pandas as pd
+
+def build_val_day_toplists(*args,
+                           df_all: Optional[pd.DataFrame] = None,
+                           split: Optional[Any] = None,
                            window_days: int = 3,
                            topk_per_day: int = 1000,
-                           min_count: int = 1) -> Dict[int, List[int]]:
+                           min_count: int = 1,
+                           mode: str = "frozen_train",
+                           date_col: str = "date",
+                           **kwargs) -> Dict[int, List[int]]:
     """
-    Для каждого дня d ∈ [val_start, val_end] строит топ-список айтемов,
-    считая частоту по окну [d - window_days, d - 1].
-    Никакой утечки: день d НЕ входит в окно.
+    Построить топ-списки айтемов для каждого дня d ∈ [val_start, val_end],
+    считая частоты по окну [d - window_days, d - 1] (день d не входит).
 
-    Возврат:
-      dict: day -> List[item_id] (длина ≤ topk_per_day)
+    Поддерживаются два способа вызова:
+
+    (A) новый (рекомендуемый):
+        build_val_day_toplists(
+            df_all=DF, split=Split, window_days=3, topk_per_day=1000,
+            min_count=1, mode='frozen_train', date_col='date'
+        )
+        где split — объект с атрибутами/ключами: train_end, val_start, val_end.
+
+    (B) старый (backward-compat):
+        build_val_day_toplists(train_df, val_start, val_end, window_days=3, topk_per_day=1000, min_count=1)
+
+    Режимы:
+      - mode='frozen_train': окно берётся ТОЛЬКО из train-отрезка (<= train_end).
+      - mode='moving': окно берётся из df_all, но всегда <= (d-1), без утечки в день d.
     """
-    df = _ensure_int_cols(train_df)
+    # -------- helpers --------
+    def _get_attr(s, key):
+        if s is None: return None
+        if isinstance(s, dict): return s.get(key, None)
+        return getattr(s, key, None)
+
+    def _ensure_date_alias(df: pd.DataFrame) -> pd.DataFrame:
+        # Истинная колонка — date. Если пережиток 'day' есть — используем его как источник date.
+        if date_col not in df.columns:
+            if "day" in df.columns:
+                df = df.copy()
+                df[date_col] = df["day"].astype(df["day"].dtype)
+            else:
+                raise KeyError(f"Дата-колонка '{date_col}' не найдена (и нет 'day').")
+        # типы
+        if not np.issubdtype(df[date_col].dtype, np.integer):
+            df = df.copy()
+            df[date_col] = df[date_col].astype("int32")
+        if "item_id" in df.columns and not np.issubdtype(df["item_id"].dtype, np.integer):
+            df["item_id"] = df["item_id"].astype("int32")
+        return df
+
+    def _top_items_in_window_df(df: pd.DataFrame, lo: int, hi: int) -> List[int]:
+        if lo > hi:
+            return []
+        sub = df.loc[(df[date_col] >= int(lo)) & (df[date_col] <= int(hi)), "item_id"]
+        if sub.empty:
+            return []
+        vc = sub.value_counts()
+        if min_count > 1:
+            vc = vc[vc >= int(min_count)]
+            if vc.empty:
+                return []
+        return vc.index.astype("int64").tolist()[: int(topk_per_day)]
+
+    # -------- parse signatures --------
+    if df_all is None and split is None and len(args) >= 3:
+        # старый стиль: (train_df, val_start, val_end, ...)
+        train_df = args[0]
+        val_start = int(args[1])
+        val_end   = int(args[2])
+        df_all = None
+        # работаем по train_df только (как раньше)
+        df_train = _ensure_date_alias(train_df)
+        toplists: Dict[int, List[int]] = {}
+        for d in range(val_start, val_end + 1):
+            lo, hi = d - int(window_days), d - 1
+            toplists[int(d)] = _top_items_in_window_df(df_train, lo, hi)
+        return toplists
+
+    # новый стиль: ожидаем df_all и split (Namespace или dict)
+    if df_all is None or split is None:
+        raise TypeError("build_val_day_toplists: нужно передать df_all= и split= в новом стиле, "
+                        "либо (train_df, val_start, val_end) в старом стиле.")
+
+    df_all = _ensure_date_alias(df_all)
+
+    val_start = _get_attr(split, "val_start")
+    val_end   = _get_attr(split, "val_end")
+    train_end = _get_attr(split, "train_end")
+    if val_start is None or val_end is None:
+        raise ValueError("split должен содержать val_start и val_end")
+    if mode == "frozen_train" and train_end is None:
+        raise ValueError("split.train_end обязателен для mode='frozen_train'")
+
+    # подвыборка для подсчётов
+    if mode == "frozen_train":
+        # считаем частоты ТОЛЬКО по train-отрезку (<= train_end)
+        df_base = df_all.loc[df_all[date_col] <= int(train_end), ["item_id", date_col]]
+    elif mode == "moving":
+        # будем резать по (<= d-1) внутри цикла
+        df_base = df_all[["item_id", date_col]]
+    else:
+        raise ValueError("mode должен быть 'frozen_train' или 'moving'")
+
     toplists: Dict[int, List[int]] = {}
     for d in range(int(val_start), int(val_end) + 1):
-        lo = d - int(window_days)
-        hi = d - 1
-        items = _top_items_in_window(df, lo, hi, min_count=min_count, topk=int(topk_per_day))
-        toplists[int(d)] = items
+        lo, hi = d - int(window_days), d - 1
+        if mode == "frozen_train":
+            toplists[int(d)] = _top_items_in_window_df(df_base, lo, hi)
+        else:  # moving
+            # ограничиваем верх границы окном d-1
+            df_m = df_base.loc[df_base[date_col] <= hi]
+            toplists[int(d)] = _top_items_in_window_df(df_m, lo, hi)
+
     return toplists
-
-
-# ---------------------------------------------------------------------------
-# 2) DayToplists → User candidates
-# ---------------------------------------------------------------------------
-
-def candidates_from_day_toplists(toplists_by_day: Dict[int, List[int]],
-                                 user_day_map: Dict[int, int],
-                                 k_top: int = 20) -> Dict[int, List[int]]:
-    """
-    Превращает day→top_items в user→top_items, используя user→day мап.
-
-    user_day_map: user_id -> day (день, на который делаем предсказание для этого пользователя)
-    k_top: сколько верхних взять из топлиста дня
-
-    Вернёт:
-      user2items: dict user_id -> List[item_id]
-    """
-    out: Dict[int, List[int]] = {}
-    for u, d in user_day_map.items():
-        items = toplists_by_day.get(int(d), [])
-        out[int(u)] = list(map(int, items[:int(k_top)]))
-    return out
 
 
 # ---------------------------------------------------------------------------
