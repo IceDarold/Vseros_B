@@ -113,7 +113,7 @@ class Exp102DailyTrending(BaseExperiment):
             # 2) per-user candidates на вал
             #    (объединяем топы по вал-дням пользователя; ограничиваемся users_val при quick)
             val_df_subset = val_df[val_df[COL_USER].isin(users_val)] if users_val else val_df
-            cand = candidates_from_day_tops(val_df_subset, day_top, K=self.cfg.per_user_M)
+            cand = candidates_from_day_toplists(val_df_subset, day_top, K=self.cfg.per_user_M)
             cand_by_user_by_W[W] = cand
 
             # 3) recall@M

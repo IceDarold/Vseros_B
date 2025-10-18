@@ -349,3 +349,4 @@ def trending_global_from_last_train_window(df_all: pd.DataFrame,
                                 date_col=date_col,
                                 topk=int(topk),
                                 min_count=int(min_count))
+candidates_from_day_tops = candidates_from_day_toplists
