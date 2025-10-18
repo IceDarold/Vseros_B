@@ -35,7 +35,7 @@ from vseros_b.metrics import recall_at_m, ndcg_at_k
 from vseros_b.features.resources import FeatureResources
 from vseros_b.features.registry import autodiscover, select
 from vseros_b.features.schema import FEATURES_VERSION, load_schema, apply_norm, coerce_dtypes
-from vseros_b.features.builders import _cand_map_to_df as cand_map_to_df, _build_matrix if False else None  # noop
+from vseros_b.features.builders import _cand_map_to_df as cand_map_to_df, build_matrix # noop
 from vseros_b.candidates.io import load_compact_map
 
 # опциональные модели — чтобы уметь пересчитать скоры, если нет val_scores
