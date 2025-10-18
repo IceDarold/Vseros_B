@@ -38,6 +38,12 @@ from .covis import (
     CoVisConfig, build_neighbors,
     last_k_items_by_user, candidates_from_covis,
 )
+try:
+    from ..covis_gpu import build_neighbors_gpu  # type: ignore
+    _GPU_AVAILABLE = True
+except Exception:
+    build_neighbors_gpu = None  # type: ignore
+    _GPU_AVAILABLE = False
 
 
 # ----------------------------- Конфиг и состояние -----------------------------
@@ -63,6 +69,7 @@ class Exp103Config:
     quick_mode: bool = QUICK_MODE
     quick_users: Optional[int] = QUICK_USERS
     seed: int = SEED
+    use_gpu: bool = _GPU_AVAILABLE  # включить GPU (если доступен RAPIDS); fallback на CPU при ошибке
 
 
 @dataclass
@@ -105,7 +112,21 @@ class Exp103CoVisV1(BaseExperiment):
             weighted_support=bool(self.cfg.weighted_support),
         )
 
-        neighbors_df = build_neighbors(basket_items, cfg=cfg)  # item_id, neighbor_id, score
+        neighbors_df = None
+        if self.cfg.use_gpu and _GPU_AVAILABLE:
+            try:
+                neighbors_df = build_neighbors_gpu(basket_items, cfg=cfg)
+                if self.verbose:
+                    print(f"[{self.exp_name}] GPU build_neighbors succeeded (rows={len(neighbors_df):,})")
+            except Exception as exc:
+                if self.verbose:
+                    print(f"[{self.exp_name}] GPU pipeline failed ({exc}); falling back to CPU.")
+                neighbors_df = None
+
+        if neighbors_df is None:
+            neighbors_df = build_neighbors(basket_items, cfg=cfg)  # item_id, neighbor_id, score
+            if self.verbose and self.cfg.use_gpu:
+                print(f"[{self.exp_name}] CPU build_neighbors used (rows={len(neighbors_df):,})")
         save_df(self.neighbors_path, neighbors_df, index=False)
         log_artifact(self.neighbors_path, name=f"{self.exp_name}_neighbors", type_="dataset")
 
