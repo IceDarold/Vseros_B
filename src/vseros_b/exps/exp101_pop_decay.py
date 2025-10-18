@@ -1,255 +1,382 @@
 # -*- coding: utf-8 -*-
-"""
-exp101_pop_decay.py
-Stage 1 — Эксперимент 101: Global Popularity (Static vs Time-Decay, λ-sweep)
-
-Артефакты:
-- artifacts/exp101_pop_decay/pop_table.parquet          (все скоринги популярности)
-- artifacts/exp101_pop_decay/coverage_curves.csv        (K, variant → coverage)
-- metrics/exp101_pop_decay.csv                           (метрики по вариантам)
-- submissions/sub_exp101_<variant>_<filter>.csv         (если вызван predict_submission)
-
-W&B:
-- лог таблиц coverage/metrics (если ран активен)
-- лог файлов как Artifacts
-"""
-
 from __future__ import annotations
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+
+import math
+import time
+from dataclasses import dataclass, field
+from types import SimpleNamespace
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 from .base_exp import BaseExperiment
-from .config import (
-    PATHS, COL_USER, COL_ITEM, COL_DATE,
-    LAMBDA_LIST, DECAY_REF, SEED,
-)
-from .artifacts import ensure_dir, save_df, log_artifact, log_table_df
-from .metrics import coverage_at_k, spearman_rank_corr, jaccard_topk
-from .pop_decay import (
-    compute_pop_static,
-    sweep_pop_decay,
-    build_global_top,
-    predict_per_user_global,
-    evaluate_global_predictions,
-    coverage_curves,
-    assemble_pop_table,
-    best_variant_by_map,
+from .config import PATHS
+from .artifacts import ensure_dir, save_df, save_and_log_df, save_json, log_table_df
+from .metrics import (
+    hr_at_k_userwise,              # аккуратный HR@K по пользователям
+    ndcg_at_k_userwise,            # аккуратный NDCG@K по пользователям
+    coverage_at_k,                 # item-coverage@K (по val_item_cnt)
 )
 
+# W&B — опционально
+try:
+    import wandb
+    _WANDB = True
+except Exception:
+    wandb = None  # type: ignore
+    _WANDB = False
 
-# ----------------------------- конфиг и состояние -----------------------------
+
+# -----------------------------------------------------------------------------
+# Конфиг/стейт
+# -----------------------------------------------------------------------------
 
 @dataclass
 class Exp101Config:
-    lambdas: Sequence[float] = tuple(LAMBDA_LIST)
-    decay_ref: Optional[int] = DECAY_REF   # если None → возьмём конец train
-    eval_k: int = 20                      # mAP@K, Hit@K, NDCG@K
-    coverage_ks: Sequence[int] = (20, 50, 100, 200, 500, 1000)
-    eval_filter_seen_in_train: bool = True
-    global_K_pool: int = 2000             # длина глобального пула для сабмита/фильтрации
-    seed: int = SEED
+    # сетка эксп. затухания по времени (чем больше, тем сильнее приоритет последним дням)
+    decay_grid: Tuple[float, ...] = (0.00, 0.02, 0.06, 0.12, 0.20)
+    # сколько кандидатов класть на пользователя (для вал/test артефактов и сабмита)
+    per_user_K: int = 600
+    # сколько верхних айтемов держать глобально (чтобы не таскать всю голову)
+    global_top_cap: int = 200_000
+    # фильтр по минимальному числу встреч в train (0 = без фильтра)
+    min_train_freq: int = 0
+    # артефактные имена и поведение
+    name: str = "exp101_pop_decay"
+    # логгировать train/val головы топов как таблицы
+    log_top_previews: bool = True
 
 
 @dataclass
 class Exp101State:
-    pop_static: pd.Series
-    pop_decay_dict: Dict[float, pd.Series]
-    metrics_df: pd.DataFrame
-    coverage_df: pd.DataFrame
-    best_variant: str
-    out_dir: Path
+    best_decay: float = 0.0
+    best_spearman: float = 0.0
+    train_item_scores: Optional[pd.Series] = None       # index=item_id, value=score
+    global_ranking: Optional[pd.Index] = None           # отсортированный список item_id
+    # кэши для сабмита/кандидатов
+    top_items_cut: Optional[pd.Index] = None
 
 
-# ----------------------------- реализация эксперимента -----------------------------
+# -----------------------------------------------------------------------------
+# Вспомогательные
+# -----------------------------------------------------------------------------
+
+def _compute_recency_weighted_pop(
+    df: pd.DataFrame, end_day: int, decay: float
+) -> pd.Series:
+    """
+    df: long (user_id, item_id, date), ТОЛЬКО train-дни
+    вес = exp(-decay * (end_day - date))
+    возвращает: Series[item_id] = score
+    """
+    if len(df) == 0:
+        return pd.Series(dtype="float32")
+
+    d = df[["item_id", "date"]].copy()
+    # чтобы избежать больших экспонент, можно центрировать на end_day
+    w = np.exp(-float(decay) * (float(end_day) - d["date"].astype("float32")))
+    d["w"] = w.astype("float32")
+    pop = d.groupby("item_id", sort=False)["w"].sum()
+    pop = pop.astype("float32")
+    return pop
+
+
+def _safe_spearman(a: pd.Series, b: pd.Series) -> float:
+    """
+    Спирмен по пересечению индексов, без NaN.
+    """
+    idx = a.index.intersection(b.index)
+    if len(idx) < 10:
+        return 0.0
+    a_rank = a.loc[idx].rank(ascending=False)
+    b_rank = b.loc[idx].rank(ascending=False)
+    a_mean = a_rank.mean()
+    b_mean = b_rank.mean()
+    num = ((a_rank - a_mean) * (b_rank - b_mean)).sum()
+    den = math.sqrt(((a_rank - a_mean) ** 2).sum()) * math.sqrt(((b_rank - b_mean) ** 2).sum())
+    if den <= 0:
+        return 0.0
+    return float(num / den)
+
+
+def _series_head_table(s: pd.Series, n: int = 20) -> pd.DataFrame:
+    """Удобный превью топа как таблицы для W&B."""
+    if s is None or len(s) == 0:
+        return pd.DataFrame({"item_id": [], "score": []})
+    head = s.sort_values(ascending=False).head(n)
+    return pd.DataFrame({"item_id": head.index.astype(np.int64), "score": head.values.astype(np.float32)})
+
+
+def _users_from_days(df: pd.DataFrame, days: List[int]) -> np.ndarray:
+    sub = df[df["date"].isin(days)]
+    return sub["user_id"].drop_duplicates().astype(np.int64).values
+
+
+# -----------------------------------------------------------------------------
+# Эксперимент
+# -----------------------------------------------------------------------------
 
 class Exp101PopDecay(BaseExperiment):
+    """
+    Простая глобальная популярность с экспоненциальным затуханием по времени.
+    - выбор decay по максимальной корреляции с вал.частотами айтемов (стабильный критерий);
+    - оценка на вал: HR/NDCG@K по пользователям (фиксированный K=20/50/100 из metrics);
+    - формирование кандидатов и сабмита (лонг-формат).
+    """
+
     def __init__(self, cfg: Optional[Exp101Config] = None):
-        super().__init__(exp_name="exp101_pop_decay")
-        self.cfg = cfg or Exp101Config()
-        self.out_dir = ensure_dir(PATHS.artifact_dir / self.exp_name)
-        self.metrics_path = PATHS.metrics_dir / f"{self.exp_name}.csv"
-        self.coverage_path = self.out_dir / "coverage_curves.csv"
-        self.pop_table_path = self.out_dir / "pop_table.parquet"
-        self.state: Optional[Exp101State] = None
+        super().__init__(exp_name=(cfg.name if cfg else "exp101_pop_decay"))
+        self.cfg: Exp101Config = cfg or Exp101Config()
+        self.state: Exp101State = Exp101State()
 
-    # ---- обязательные методы ----
-
-    def fit(self, context: dict) -> Exp101State:
-        """
-        Строим глобальные скоринги популярности по TRAIN (статик + λ-свип decay).
-        """
-        self.require_context_keys(context, ["train_df", "val_df", "split", "val_truth", "val_item_cnt"])
-        train_df: pd.DataFrame = context["train_df"]
-        split                  = context["split"]
-        val_item_cnt: pd.Series = context["val_item_cnt"]
-
-        ref = self.cfg.decay_ref
-        if ref is None:
-            ref = split.train_end  # конец train
-
-        # 1) скоринги
-        pop_static = compute_pop_static(train_df, ensure_unique_triplets=False)
-        pop_decay_dict = sweep_pop_decay(train_df, self.cfg.lambdas, ref_day=ref, ensure_unique_triplets=False)
-
-        # 2) coverage@K для каждого варианта
-        cov_rows = []
-        cov_s = coverage_curves(pop_static, val_item_cnt, ks=self.cfg.coverage_ks)
-        cov_s["variant"] = "static"
-        cov_rows.append(cov_s)
-
-        for lam, s in pop_decay_dict.items():
-            cov_d = coverage_curves(s, val_item_cnt, ks=self.cfg.coverage_ks)
-            cov_d["variant"] = f"decay@{lam}"
-            cov_rows.append(cov_d)
-
-        coverage_all = pd.concat(cov_rows, ignore_index=True)
-
-        # 3) сохраним общий pop_table
-        pop_tbl = assemble_pop_table(pop_static, pop_decay_dict)
-        save_df(self.pop_table_path, pop_tbl, index=True)
-        log_artifact(self.pop_table_path, name=f"{self.exp_name}_pop_table", type_="dataset")
-
-        # 4) сохраним coverage
-        save_df(self.coverage_path, coverage_all, index=False)
-        log_artifact(self.coverage_path, name=f"{self.exp_name}_coverage", type_="dataset")
-        self.wandb_log_table("exp101_coverage", coverage_all)
-
-        # наполним state
-        self.state = Exp101State(
-            pop_static=pop_static,
-            pop_decay_dict=pop_decay_dict,
-            metrics_df=pd.DataFrame(),
-            coverage_df=coverage_all,
-            best_variant="static",
-            out_dir=self.out_dir,
-        )
-        return self.state
-
-    def evaluate(self, context: dict) -> pd.DataFrame:
-        """
-        Считает ранжировочные метрики на валидации для каждого варианта глобального топа.
-        """
-        assert self.state is not None, "Call fit() first."
-        self.require_context_keys(context, ["train_df", "val_df", "split", "val_truth"])
+    # ---- fit: обучаемся на train, подбираем decay, собираем ранжирование ----
+    def fit(self, context: Dict) -> Exp101State:
+        t0 = time.time()
+        self.require_context_keys(context, ["train_df", "val_df", "split", "val_item_cnt"])
 
         train_df: pd.DataFrame = context["train_df"]
         val_df: pd.DataFrame = context["val_df"]
-        split = context["split"]
-        val_truth: Mapping[int, set] = context["val_truth"]
+        split: SimpleNamespace = context["split"]
+        val_item_cnt: pd.Series = context["val_item_cnt"]
 
-        users_val = list(val_truth.keys())
-        k_eval = self.cfg.eval_k
+        # фильтр по train-частоте (если включён)
+        if self.cfg.min_train_freq > 0:
+            vc = train_df["item_id"].value_counts()
+            keep_items = set(vc[vc >= int(self.cfg.min_train_freq)].index.astype(np.int64))
+            train_df = train_df[train_df["item_id"].isin(keep_items)]
+            if self.verbose:
+                print(f"[{self.exp_name}] after freq>={self.cfg.min_train_freq}: train rows={len(train_df):,}, uniq items={train_df['item_id'].nunique():,}")
 
-        # подготовим карту seen (если включена оценка с фильтром)
-        seen_map = None
-        if self.cfg.eval_filter_seen_in_train:
-            seen_map = train_df.groupby(COL_USER)[COL_ITEM].apply(lambda s: set(map(int, s.values))).to_dict()
+        # подберём decay по корреляции c вал. частотами айтемов
+        best_decay, best_r = 0.0, -1.0
+        best_scores = None
 
-        rows = []
+        for d in self.cfg.decay_grid:
+            scores = _compute_recency_weighted_pop(train_df, end_day=int(split.train_end), decay=float(d))
+            # нормализация (по желанию можно не делать)
+            scores = scores / max(1e-9, float(scores.max()))
+            r = _safe_spearman(scores, val_item_cnt)
+            if self.verbose:
+                print(f"[{self.exp_name}] decay={d:.3f} spearman(train_pop vs val_cnt)={r:.5f}   (items={len(scores):,})")
+            if r > best_r:
+                best_r = r
+                best_decay = d
+                best_scores = scores
 
-        # STATIC
-        global_static = build_global_top(self.state.pop_static, K=self.cfg.global_K_pool)
-        for filter_mode, smap in (("no_filter", None), ("filter_seen", seen_map)):
-            preds = predict_per_user_global(users_val, global_static, k=k_eval, seen_map=smap)
-            res = evaluate_global_predictions(val_truth, preds, k_eval=k_eval, variant_name="static")
-            rows.append({
-                "variant": "static", "filter": filter_mode,
-                "map@20": res.map_at_k, "hit@20": res.hit_at_k, "ndcg@20": res.ndcg_at_k
+        if best_scores is None:
+            # на всякий случай fallback
+            best_scores = train_df["item_id"].value_counts().astype("float32")
+            best_scores = best_scores / max(1.0, float(best_scores.max()))
+            best_decay = 0.0
+            best_r = _safe_spearman(best_scores, val_item_cnt)
+
+        # сортировка головы
+        order = best_scores.sort_values(ascending=False)
+        if self.cfg.global_top_cap and self.cfg.global_top_cap > 0:
+            order = order.head(int(self.cfg.global_top_cap))
+        top_items = order.index
+
+        # сохраняем в state
+        self.state.best_decay = float(best_decay)
+        self.state.best_spearman = float(best_r)
+        self.state.train_item_scores = order.astype("float32")
+        self.state.global_ranking = pd.Index(order.index.astype(np.int64))
+        self.state.top_items_cut = self.state.global_ranking
+
+        # W&B превью
+        if _WANDB and wandb.run is not None and self.cfg.log_top_previews:
+            log_table_df(f"{self.exp_name}/top_train_head", _series_head_table(order, 25))
+            try:
+                wandb.summary[f"{self.exp_name}/best_variant"] = f"decay_{best_decay:.2f}"
+                wandb.summary[f"{self.exp_name}/spearman_train_val"] = float(best_r)
+            except Exception:
+                pass
+
+        if self.verbose:
+            print(f"[{self.exp_name}] best decay={best_decay:.3f}, spearman={best_r:.5f}, kept items={len(order):,} (cap={self.cfg.global_top_cap})")
+
+        if _WANDB and wandb.run is not None:
+            wandb.log({f"{self.exp_name}/fit_payload": 1})
+
+        if self.verbose:
+            print(f"[{self.exp_name}] fit() done in {time.time()-t0:.1f}s")
+        return self.state
+
+    # ---- evaluate: считаем HR/NDCG/coverage на вал ----
+    def evaluate(self, context: Dict) -> pd.DataFrame:
+        t0 = time.time()
+        self.require_context_keys(context, ["val_df", "split", "val_item_cnt"])
+        assert self.state.global_ranking is not None, "Run fit() first."
+
+        val_df: pd.DataFrame = context["val_df"]
+        split: SimpleNamespace = context["split"]
+        val_item_cnt: pd.Series = context["val_item_cnt"]
+
+        K_list = (20, 50, 100)
+
+        # единый топ для всех пользователей
+        gtop = list(self.state.global_ranking)
+        # HR/NDCG @ K — userwise
+        hr_rows = []
+        ndcg_rows = []
+        for K in K_list:
+            hr = hr_at_k_userwise(val_df, gtop[:K])
+            nd = ndcg_at_k_userwise(val_df, gtop[:K])
+            hr_rows.append({"k": K, "HR@k": hr})
+            ndcg_rows.append({"k": K, "NDCG@k": nd})
+
+        # coverage@K — item coverage на вал-юниверсе
+        cov_rows = []
+        order_series = self.state.train_item_scores  # Series[item_id]=score
+        for K in K_list:
+            cov = coverage_at_k(order_series, val_item_cnt, ks=(K,))
+            cov_rows.append({"k": K, "COV@k": float(cov.iloc[0]["coverage"]) if hasattr(cov, "iloc") else float(cov)})
+
+        # соберём таблицу метрик
+        # (соединим по k)
+        m = pd.DataFrame({"k": K_list})
+        m = m.merge(pd.DataFrame(hr_rows), on="k", how="left")
+        m = m.merge(pd.DataFrame(ndcg_rows), on="k", how="left")
+        m = m.merge(pd.DataFrame(cov_rows), on="k", how="left")
+
+        # лог в csv и W&B
+        out_dir = ensure_dir(PATHS.artifact_dir / "models" / self.cfg.name)
+        save_df(out_dir / "val_metrics.csv", m, index=False)
+        if _WANDB and wandb.run is not None:
+            log_table_df(f"{self.exp_name}/val_metrics", m)
+
+        if self.verbose:
+            print(f"[{self.exp_name}] evaluate() →\n{m}")
+            print(f"[{self.exp_name}] evaluate() done in {time.time()-t0:.1f}s")
+
+        return m
+
+    # ---- save: положим "модель" (глобальный топ) + кандидатов val/test ----
+    def save(self, context: Dict) -> Tuple[Optional[str], Optional[str]]:
+        t0 = time.time()
+        self.require_context_keys(context, ["train_df", "val_df", "split", "sample_df"])
+        assert self.state.top_items_cut is not None, "Run fit() first."
+
+        train_df: pd.DataFrame = context["train_df"]
+        val_df: pd.DataFrame = context["val_df"]
+        split: SimpleNamespace = context["split"]
+        sample_df: pd.DataFrame = context["sample_df"]
+
+        # --- 1) сохраним «модель» (глобальные веса айтемов) ---
+        model_dir = ensure_dir(PATHS.artifact_dir / "models" / self.cfg.name)
+        scores = self.state.train_item_scores.rename("score").reset_index().rename(columns={"index": "item_id"})
+        save_df(model_dir / "item_scores.parquet", scores, index=False)
+        meta = {
+            "best_decay": self.state.best_decay,
+            "best_spearman": self.state.best_spearman,
+            "global_top_cap": self.cfg.global_top_cap,
+            "min_train_freq": self.cfg.min_train_freq,
+        }
+        save_json(model_dir / "model_meta.json", meta)
+
+        # лог как артефакт (W&B — опционально)
+        if _WANDB and wandb.run is not None:
+            try:
+                save_and_log_df(scores, model_dir / "item_scores_for_wandb.csv",
+                                artifact_name=f"{self.cfg.name}_item_scores",
+                                artifact_type="model-scores",
+                                table_key=f"{self.exp_name}/item_scores_preview")
+            except Exception:
+                pass
+
+        # --- 2) кандидаты для валидации и теста ---
+        cand_dir = ensure_dir(PATHS.cand_dir / self.cfg.name)
+        K = int(self.cfg.per_user_K)
+        gtop = list(self.state.top_items_cut)
+
+        # val users
+        val_users = _users_from_days(val_df, list(split.val_days))
+        # test users — из sample
+        test_users = sample_df["user_id"].drop_duplicates().astype(np.int64).values
+
+        def _mk_cands(users: np.ndarray) -> pd.DataFrame:
+            # одинаковый топ на всех — быстро через repeat без explode
+            n = len(users)
+            k = min(K, len(gtop))
+            items = np.array(gtop[:k], dtype=np.int64)
+            # сформируем каркас
+            u_col = np.repeat(users, k)
+            i_col = np.tile(items, n)
+            r_col = np.tile(np.arange(1, k + 1, dtype=np.int32), n)
+            s_col = (1.0 / r_col).astype("float32")  # простая убывающая «оценка»
+            out = pd.DataFrame({
+                "user_id": u_col,
+                "item_id": i_col,
+                "rank": r_col,
+                "score": s_col,
+                "src": self.cfg.name,
             })
+            return out
 
-        # DECAY — каждый λ
-        for lam, s in self.state.pop_decay_dict.items():
-            global_top = build_global_top(s, K=self.cfg.global_K_pool)
-            for filter_mode, smap in (("no_filter", None), ("filter_seen", seen_map)):
-                preds = predict_per_user_global(users_val, global_top, k=k_eval, seen_map=smap)
-                res = evaluate_global_predictions(val_truth, preds, k_eval=k_eval, variant_name=f"decay@{lam}")
-                rows.append({
-                    "variant": f"decay@{lam}", "filter": filter_mode,
-                    "map@20": res.map_at_k, "hit@20": res.hit_at_k, "ndcg@20": res.ndcg_at_k
-                })
+        val_cands = _mk_cands(val_users)
+        test_cands = _mk_cands(test_users)
 
-        metrics_df = pd.DataFrame(rows).sort_values(["filter", "map@20", "ndcg@20"], ascending=[True, False, False]).reset_index(drop=True)
-        self.state.metrics_df = metrics_df
+        p_val = save_df(cand_dir / "val_candidates.parquet", val_cands, index=False)
+        p_test = save_df(cand_dir / "test_candidates.parquet", test_cands, index=False)
 
-        # Логи и сохранение
-        self.wandb_log_table("exp101_metrics", metrics_df)
-        self.save_metrics_df(metrics_df, filename=f"{self.exp_name}.csv", artifact_name=f"{self.exp_name}_metrics")
+        if self.verbose:
+            print(f"[{self.exp_name}] saved candidates: val={val_cands.shape}, test={test_cands.shape}")
+            print(f"[{self.exp_name}] save() done in {time.time()-t0:.1f}s")
 
-        # Найдём лучший вариант по mAP@20 (по no_filter — чаще главный)
-        best_no_filter = metrics_df[metrics_df["filter"] == "no_filter"]
-        if not best_no_filter.empty:
-            self.state.best_variant = best_variant_by_map(best_no_filter, variant_col="variant", map_col="map@20") or "static"
-        else:
-            self.state.best_variant = best_variant_by_map(metrics_df, variant_col="variant", map_col="map@20") or "static"
+        return str(p_val), str(p_test)
 
-        # Доп: дрейф популярности (train vs val) — для отчёта
-        train_item_cnt = train_df.groupby(COL_ITEM)[COL_DATE].count()
-        val_item_cnt = val_df.groupby(COL_ITEM)[COL_DATE].count()
+    # ---- predict_submission: возвращаем ЛОНГ-формат под sample_df ----
+    def predict_submission(self, context: Dict, sample_df: pd.DataFrame, k_top: int = 20) -> pd.DataFrame:
+        """
+        Ожидаем, что sample_df имеет колонки ['user_id','item_id'] и каждые K строк на пользователя.
+        Возвращаем копию sample_df с заполненным 'item_id' (лонг-формат).
+        """
+        assert self.state.top_items_cut is not None, "Run fit() first."
+        t0 = time.time()
+
+        K = int(k_top)
+        gtop = list(self.state.top_items_cut[:K])
+
+        # быстрый assign: сформируем map user->topK и вливаем батчем
+        users = sample_df["user_id"].values
+        uniq_users, inv = np.unique(users, return_inverse=True)
+        topK = np.array(gtop, dtype=np.int64)
+        # ожидаем, что в sample по каждому юзеру ровно K строк (валидация структуры — опционально)
+        # соберём матрицу (U,K) → развёрнем по inv
+        # если в sample иногда !=K, безопаснее просто «циклом»; но это медленнее
+        filled = sample_df.copy()
+        # создадим шаблон (для каждого uniq_user — свой список topK)
+        pool = np.vstack([topK for _ in range(len(uniq_users))])
+        # сколько строк на пользователя в sample
+        # аккуратный способ — отсортированный sample: будем пробегать и повторять
+        # но здесь предположим ровно K на пользователя:
         try:
-            sp = spearman_rank_corr(train_item_cnt, val_item_cnt)
-            jacc_tbl = jaccard_topk(train_item_cnt, val_item_cnt, ks=self.cfg.coverage_ks)
-            self.wandb_log_table("exp101_drift_jaccard", jacc_tbl)
-            self.wandb_summary(**{"exp101/best_variant": self.state.best_variant, "exp101/spearman_train_val": float(sp)})
+            # проверка (не падаем, просто предупреждаем)
+            counts = pd.Series(users).value_counts().values
+            if not np.all(counts == K):
+                # fallback — медленнее, но корректно
+                grp = filled.groupby("user_id", sort=False)
+                rows = []
+                for uid, g in grp:
+                    need = len(g)
+                    take = min(K, len(topK))
+                    rep = np.resize(topK[:take], need)
+                    out = g.copy()
+                    out.loc[:, "item_id"] = rep
+                    rows.append(out)
+                filled = pd.concat(rows, axis=0, ignore_index=True)
+                if self.verbose:
+                    print(f"[{self.exp_name}] sample has irregular K per user → used safe fallback path.")
+                return filled
         except Exception:
             pass
 
-        return metrics_df
-
-    def save(self, context: dict) -> Tuple[Optional[Path], Optional[Path]]:
-        """
-        Уже сохраняли coverage и pop_table в fit(); здесь ничего доп. не требуется.
-        Вернём пути на всякий случай.
-        """
-        return self.pop_table_path, self.coverage_path
-
-    # ---- сабмит ----
-
-    def predict_submission(self, context: dict, sample_df: pd.DataFrame, k_top: int = 20, use_filter_seen: bool = False) -> pd.DataFrame:
-        """
-        Делает сабмит для лучшего варианта (по mAP@20). По умолчанию без фильтра "seen".
-        """
-        assert self.state is not None and not self.state.metrics_df.empty, "Run fit() and evaluate() first."
-
-        best = self.state.best_variant or "static"
-        if best == "static":
-            score_series = self.state.pop_static
-        else:
-            # формат 'decay@<λ>'
-            lam = float(str(best).split("@")[1])
-            score_series = self.state.pop_decay_dict[lam]
-
-        global_top = build_global_top(score_series, K=max(k_top, self.cfg.global_K_pool))
-
-        seen_map = None
-        if use_filter_seen:
-            train_df: pd.DataFrame = context["train_df"]
-            seen_map = train_df.groupby(COL_USER)[COL_ITEM].apply(lambda s: set(map(int, s.values))).to_dict()
-
-        # заполняем sample
-        tmp = sample_df.copy()
-        tmp["rank"] = tmp.groupby(COL_USER).cumcount()
-        rank2item = np.array(global_top[:k_top], dtype=np.int64)
-
-        if not use_filter_seen:
-            tmp[COL_ITEM] = rank2item[tmp["rank"].values]
-        else:
-            # медленнее: фильтруем per-user
-            users = tmp[COL_USER].unique()
-            # построим список top-k на пользователя
-            top_by_user: Dict[int, List[int]] = predict_per_user_global(users, global_top, k=k_top, seen_map=seen_map)
-            tmp[COL_ITEM] = [top_by_user[int(u)][int(r)] for u, r in zip(tmp[COL_USER].values, tmp["rank"].values)]
-
-        tmp = tmp.drop(columns=["rank"]).reset_index(drop=True)
-
-        # сохраняем сабмит
-        suffix = "filterseen" if use_filter_seen else "nofilter"
-        sub_dir = ensure_dir(PATHS.sub_dir)
-        sub_path = sub_dir / f"sub_exp101_{best}_{suffix}.csv"
-        save_df(sub_path, tmp, index=False)
-        log_artifact(sub_path, name=f"{self.exp_name}_submission_{best}_{suffix}", type_="submission")
-
-        return tmp
+        # быстрый путь: восстановим порядок sample
+        # индексы внутри каждого пользователя должны идти блоками длины K
+        # сформируем вектор item_id согласно исходному порядку
+        # inv даёт индекс uniq_user для каждой строки sample
+        filled["item_id"] = pool[inv, np.arange(len(inv)) % K]
+        if self.verbose:
+            print(f"[{self.exp_name}] predict_submission() done in {time.time()-t0:.1f}s  (rows={len(filled):,})")
+        return filled

@@ -10,9 +10,11 @@ artifacts.py — утилиты для сохранения/загрузки а�
 
 from __future__ import annotations
 
+import logging
+import os
 import re
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Union, Dict, Any
+from typing import Iterable, List, Optional, Sequence, Union, Dict, Any, Mapping
 
 import json
 import pandas as pd
@@ -26,6 +28,13 @@ except Exception:  # pragma: no cover
     _WANDB_AVAILABLE = False
 
 from .config import PATHS
+
+
+# =============================================================================
+# Логгер
+# =============================================================================
+
+LOGGER = logging.getLogger("vseros_b.artifacts")
 
 
 # =============================================================================
@@ -96,8 +105,14 @@ def already_exists(path: Union[str, Path]) -> bool:
 # W&B helpers
 # =============================================================================
 
+def _wandb_offline() -> bool:
+    return os.getenv("WANDB_MODE", "").lower() == "offline"
+
+
 def _wandb_is_ready() -> bool:
     if not _WANDB_AVAILABLE:
+        return False
+    if _wandb_offline():
         return False
     try:
         return wandb.run is not None  # type: ignore[attr-defined]
@@ -157,9 +172,11 @@ def log_artifact(paths: Union[str, Path, Sequence[Union[str, Path]]],
         for p in file_list:
             art.add_file(str(p))
         wandb.log_artifact(art, aliases=safe_aliases)  # type: ignore[attr-defined]
+        LOGGER.info("Logged artifact '%s' with files: %s", safe_name, [str(p) for p in file_list])
         return art
     except Exception:
         # мягко игнорируем любые проблемы логирования
+        LOGGER.warning("Failed to log W&B artifact '%s'", safe_name, exc_info=True)
         return None
 
 
@@ -171,8 +188,10 @@ def log_table_df(key: str, df: pd.DataFrame) -> None:
         return
     try:
         wandb.log({key: wandb.Table(dataframe=df)})  # type: ignore[attr-defined]
+        LOGGER.debug("Logged W&B table '%s' (%d rows)", key, len(df))
     except Exception:
         # мягко игнорируем любые проблемы логирования
+        LOGGER.warning("Failed to log W&B table '%s'", key, exc_info=True)
         pass
 
 
@@ -198,7 +217,42 @@ def save_and_log_df(df: pd.DataFrame,
             pass
     if table_key:
         log_table_df(table_key, df)
+
     return path
+
+
+def log_metrics(metrics: Mapping[str, Any], prefix: str = "", step: Optional[int] = None) -> None:
+    """
+    Логирует словарь метрик в W&B (если ран активен).
+    """
+    if not _wandb_is_ready():
+        return
+    try:
+        payload = {f"{prefix}{k}": v for k, v in metrics.items()}
+        wandb.log(payload, step=step)  # type: ignore[attr-defined]
+        LOGGER.debug("Logged metrics to W&B: %s", payload)
+    except Exception:
+        LOGGER.warning("Failed to log metrics %s", metrics, exc_info=True)
+
+
+def download_artifact(artifact_ref: str, target_dir: Union[str, Path]) -> Optional[Path]:
+    """
+    Скачивает W&B Artifact по полному ref (entity/project/name:alias) в target_dir.
+    Возвращает путь к локальной папке или None, если W&B недоступен.
+    """
+    if not _WANDB_AVAILABLE or _wandb_offline():
+        LOGGER.debug("Skipping artifact download for '%s' (W&B unavailable/offline)", artifact_ref)
+        return None
+    try:
+        api = wandb.Api()  # type: ignore[attr-defined]
+        art = api.artifact(artifact_ref)  # type: ignore[attr-defined]
+        target_dir = ensure_dir(target_dir)
+        local_path = Path(art.download(root=str(target_dir)))  # type: ignore[attr-defined]
+        LOGGER.info("Downloaded artifact '%s' → %s", artifact_ref, local_path)
+        return local_path
+    except Exception:
+        LOGGER.warning("Failed to download artifact '%s'", artifact_ref, exc_info=True)
+        return None
 
 
 # =============================================================================

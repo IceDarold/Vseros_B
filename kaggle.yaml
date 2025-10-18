@@ -1,0 +1,19 @@
+# Kaggle runtime configuration for Vseros_B pipeline.
+# Update the dataset paths and W&B artifact refs to match your environment.
+paths:
+  train_path: /kaggle/input/vseros-b/train_data.pq
+  sample_path: /kaggle/input/vseros-b/sample_submission.csv
+  artifact_dir: artifacts
+  interm_dir: artifacts/intermediates
+  cand_dir: artifacts/candidates
+  metrics_dir: artifacts/metrics
+  sub_dir: submissions
+
+artifacts:
+  candidates:
+    # Heavy candidates precomputed via notebooks/kg_job_exp103.ipynb
+    exp103_covis_v1: "<entity>/<project>/exp103_covis_v1-candidates-<alias>:latest"
+    # Heavy candidates precomputed via notebooks/kg_job_exp104.ipynb
+    exp104_covis_2hop: "<entity>/<project>/exp104_covis_2hop-candidates-<alias>:latest"
+    # Heavy candidates precomputed via notebooks/kg_job_exp105.ipynb
+    exp105_item2vec: "<entity>/<project>/exp105_item2vec-candidates-<alias>:latest"
